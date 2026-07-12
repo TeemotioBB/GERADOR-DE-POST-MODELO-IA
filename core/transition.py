@@ -33,7 +33,7 @@ def _gray_hist(frame: np.ndarray) -> np.ndarray:
 
 
 def _difference_features(reference: np.ndarray, current: np.ndarray) -> tuple[float, float, float]:
-    """Retorna mudança global, intensidade média e cobertura espacial."""
+    """Retorna proporção alterada, diferença média e cobertura espacial."""
     if reference.shape != current.shape:
         current = cv2.resize(current, (reference.shape[1], reference.shape[0]))
 
@@ -62,6 +62,26 @@ def _difference_features(reference: np.ndarray, current: np.ndarray) -> tuple[fl
 
 def _hist_distance(first: np.ndarray, second: np.ndarray) -> float:
     return float(cv2.compareHist(first, second, cv2.HISTCMP_BHATTACHARYYA))
+
+
+def _feature_score(
+    first: np.ndarray,
+    second: np.ndarray,
+    first_hist: np.ndarray | None = None,
+    second_hist: np.ndarray | None = None,
+) -> tuple[float, float, float, float, float]:
+    global_ratio, mean_diff, spatial = _difference_features(first, second)
+    hist_distance = _hist_distance(
+        first_hist if first_hist is not None else _gray_hist(first),
+        second_hist if second_hist is not None else _gray_hist(second),
+    )
+    score = (
+        0.38 * spatial
+        + 0.25 * global_ratio
+        + 0.17 * min(mean_diff * 4.0, 1.0)
+        + 0.20 * min(hist_distance * 1.5, 1.0)
+    )
+    return score, global_ratio, mean_diff, spatial, hist_distance
 
 
 def _load_samples(
@@ -169,88 +189,133 @@ def _intro_looks_static(times: list[float], frames: list[np.ndarray]) -> bool:
     )
 
 
+def _median_frame(frames: list[np.ndarray], start: int, end: int) -> np.ndarray:
+    selected = frames[max(0, start):max(start + 1, end)]
+    if not selected:
+        selected = [frames[max(0, min(start, len(frames) - 1))]]
+    return np.median(np.stack(selected), axis=0).astype(np.uint8)
+
+
 def _detect_moving_take_end(
     times: list[float],
     frames: list[np.ndarray],
     hists: list[np.ndarray],
     *,
     min_time: float,
+    sample_rate: float,
 ) -> TransitionResult | None:
-    if len(frames) < 4:
+    """Detecta corte real quando o primeiro take possui movimento.
+
+    A versão anterior aceitava uma diferença grande entre dois quadros consecutivos.
+    Movimento do rosto, mão ou celular podia ser interpretado como troca e fazia o
+    vídeo original reaparecer ainda no primeiro take. Agora cada candidato precisa:
+
+    1. ser um pico local de mudança;
+    2. separar duas janelas de quadros visualmente diferentes;
+    3. permanecer diferente nos quadros posteriores.
+    """
+    if len(frames) < 7:
         return None
 
-    scores: list[float] = []
-    feature_rows: list[tuple[float, float, float, float]] = []
+    boundary_scores: list[float] = [0.0]
+    boundary_features: list[tuple[float, float, float, float]] = [(0.0, 0.0, 0.0, 0.0)]
     for index in range(1, len(frames)):
-        global_ratio, mean_diff, spatial = _difference_features(frames[index - 1], frames[index])
-        hist_distance = _hist_distance(hists[index - 1], hists[index])
-        score = (
-            0.38 * spatial
-            + 0.25 * global_ratio
-            + 0.17 * min(mean_diff * 4.0, 1.0)
-            + 0.20 * min(hist_distance * 1.5, 1.0)
+        score, global_ratio, mean_diff, spatial, hist_distance = _feature_score(
+            frames[index - 1], frames[index], hists[index - 1], hists[index]
         )
-        scores.append(score)
-        feature_rows.append((global_ratio, mean_diff, spatial, hist_distance))
+        boundary_scores.append(score)
+        boundary_features.append((global_ratio, mean_diff, spatial, hist_distance))
 
+    window = max(3, int(round(sample_rate * 0.42)))
     strongest = 0.0
-    for offset, score in enumerate(scores, start=1):
-        time_sec = times[offset]
+    candidates: list[tuple[float, int, float]] = []
+
+    for index in range(window, len(frames) - window):
+        time_sec = times[index]
         if time_sec < min_time:
             continue
-        strongest = max(strongest, score)
-        global_ratio, mean_diff, spatial, hist_distance = feature_rows[offset - 1]
 
-        history = scores[max(0, offset - 13) : max(1, offset - 1)]
-        baseline = float(np.median(history)) if history else 0.0
-        mad = float(np.median(np.abs(np.asarray(history) - baseline))) if history else 0.0
-        adaptive_limit = max(0.32, baseline + max(0.14, 4.0 * mad))
+        adjacent_score = boundary_scores[index]
+        strongest = max(strongest, adjacent_score)
 
-        hard_cut = (
-            (spatial >= 0.46 and global_ratio >= 0.27 and (mean_diff >= 0.085 or hist_distance >= 0.20))
-            or (hist_distance >= 0.45 and global_ratio >= 0.18 and spatial >= 0.28)
-        )
-        adaptive_cut = score >= adaptive_limit and spatial >= 0.30 and global_ratio >= 0.18
-        if not (hard_cut or adaptive_cut):
+        neighborhood = boundary_scores[max(1, index - window):min(len(boundary_scores), index + window + 1)]
+        if adjacent_score + 1e-9 < max(neighborhood):
             continue
 
-        # Confirma que não foi somente um flash/quadro isolado: os próximos quadros
-        # precisam continuar diferentes do quadro imediatamente anterior ao corte.
-        before = frames[offset - 1]
-        before_hist = hists[offset - 1]
+        history = boundary_scores[max(1, index - 2 * window):index]
+        future_motion = boundary_scores[index + 1:min(len(boundary_scores), index + 1 + window)]
+        baseline_values = history + future_motion
+        baseline = float(np.median(baseline_values)) if baseline_values else 0.0
+        mad = float(np.median(np.abs(np.asarray(baseline_values) - baseline))) if baseline_values else 0.0
+        peak_limit = max(0.30, baseline + max(0.12, 4.5 * mad), baseline * 1.75)
+        if adjacent_score < peak_limit:
+            continue
+
+        pre_scene = _median_frame(frames, index - window, index)
+        post_scene = _median_frame(frames, index, index + window)
+        scene_score, scene_global, scene_mean, scene_spatial, scene_hist = _feature_score(
+            pre_scene, post_scene
+        )
+
+        # Uma troca verdadeira altera a identidade visual da cena inteira. Um gesto
+        # ou movimento de câmera costuma gerar pico entre quadros, mas as medianas
+        # das janelas anterior e posterior continuam relativamente parecidas.
+        persistent_change = (
+            (scene_spatial >= 0.50 and scene_global >= 0.30 and scene_mean >= 0.075)
+            or (scene_hist >= 0.43 and scene_global >= 0.22 and scene_spatial >= 0.36)
+            or (scene_score >= 0.50 and scene_spatial >= 0.42 and scene_global >= 0.25)
+        )
+        if not persistent_change:
+            continue
+
+        before_scene = pre_scene
+        before_hist = _gray_hist(before_scene)
         confirmations = 0
         checked = 0
-        for future in range(offset, min(len(frames), offset + 3)):
+        for future_index in range(index, min(len(frames), index + window)):
             checked += 1
-            future_global, future_mean, future_spatial = _difference_features(before, frames[future])
-            future_hist = _hist_distance(before_hist, hists[future])
+            _, future_global, future_mean, future_spatial, future_hist = _feature_score(
+                before_scene,
+                frames[future_index],
+                before_hist,
+                hists[future_index],
+            )
             if (
-                future_spatial >= 0.34
-                or future_global >= 0.28
-                or (future_hist >= 0.34 and future_global >= 0.15 and future_mean >= 0.05)
+                future_spatial >= 0.40
+                and future_global >= 0.23
+                and (future_mean >= 0.06 or future_hist >= 0.30)
             ):
                 confirmations += 1
-        if confirmations < min(2, checked):
+
+        required = max(2, int(np.ceil(checked * 0.65)))
+        if confirmations < required:
             continue
 
-        confidence = min(0.99, 0.50 + score + min(0.18, max(0.0, score - baseline)))
-        return TransitionResult(
-            round(time_sec, 3),
-            confidence,
-            f"Corte entre takes detectado em {time_sec:.2f}s, mesmo com movimento no primeiro take.",
-        )
+        combined = 0.42 * adjacent_score + 0.58 * scene_score
+        confidence = min(0.99, 0.48 + combined + min(0.12, max(0.0, adjacent_score - baseline)))
+        candidates.append((time_sec, index, confidence))
 
-    return TransitionResult(None, max(0.0, min(strongest, 0.49)), "")
+    if not candidates:
+        return TransitionResult(None, max(0.0, min(strongest, 0.49)), "")
+
+    # Entre cortes válidos, usa o primeiro. Agora ele já foi confirmado pelas
+    # janelas anterior/posterior, então não é apenas o primeiro movimento forte.
+    detected, _, confidence = min(candidates, key=lambda item: item[0])
+    return TransitionResult(
+        round(detected, 3),
+        confidence,
+        f"Troca real entre cenas detectada em {detected:.2f}s.",
+    )
 
 
 def detect_intro_end(
     video_path: str | Path,
     *,
-    sample_rate: float = 8.0,
+    sample_rate: float = 10.0,
     min_time: float = 0.7,
     max_scan_seconds: float | None = None,
 ) -> TransitionResult:
-    """Detecta a primeira troca de take, com intro estática ou em movimento."""
+    """Detecta o ponto em que termina o primeiro take do vídeo original."""
 
     info = probe_video(video_path)
     scan_limit = max_scan_seconds if max_scan_seconds is not None else TRANSITION_MAX_SCAN_SECONDS
@@ -267,22 +332,26 @@ def detect_intro_end(
         raise MediaError("Não foi possível ler quadros suficientes para analisar o vídeo.")
 
     looks_static = _intro_looks_static(times, frames)
-    static_result = _detect_static_take_end(times, frames, min_time=min_time) if looks_static else None
-    moving_result = _detect_moving_take_end(times, frames, hists, min_time=min_time)
+    if looks_static:
+        result = _detect_static_take_end(times, frames, min_time=min_time)
+    else:
+        result = _detect_moving_take_end(
+            times,
+            frames,
+            hists,
+            min_time=min_time,
+            sample_rate=sample_rate,
+        )
 
-    candidates = [result for result in (static_result, moving_result) if result and result.seconds is not None]
-    if candidates:
-        return min(candidates, key=lambda result: float(result.seconds or 0.0))
+    if result and result.seconds is not None:
+        return result
 
-    confidence = max(
-        static_result.confidence if static_result else 0.0,
-        moving_result.confidence if moving_result else 0.0,
-    )
+    confidence = result.confidence if result else 0.0
     scanned_note = "" if scan_until >= info.duration - 0.05 else f" nos primeiros {scan_until:.0f}s"
     return TransitionResult(
         None,
         confidence,
-        f"Nenhuma troca de take confiável foi encontrada{scanned_note}.",
+        f"Nenhuma troca real de take foi encontrada{scanned_note}.",
     )
 
 
@@ -290,7 +359,7 @@ def detect_intro_end(
 def detect_static_intro_end(
     video_path: str | Path,
     *,
-    sample_rate: float = 8.0,
+    sample_rate: float = 10.0,
     min_time: float = 0.7,
     max_scan_seconds: float | None = None,
 ) -> TransitionResult:
