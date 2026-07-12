@@ -166,7 +166,7 @@ def _detect_static_take_end(
     def still_changed(global_ratio: float, spatial: float, hist_distance: float) -> bool:
         # Depois do corte a cena pode ter movimento, então o critério de
         # permanência é um pouco mais tolerante do que o de disparo.
-        return spatial >= 0.30 and (global_ratio >= 0.18 or hist_distance >= 0.28)
+        return spatial >= 0.32 and (global_ratio >= 0.20 or hist_distance >= 0.30)
 
     def returned_to_intro(global_ratio: float, spatial: float, hist_distance: float) -> bool:
         return global_ratio < 0.08 and spatial < 0.12 and hist_distance < 0.10
@@ -229,8 +229,8 @@ def _detect_static_take_end(
         detected_time = time_sec
         if boundaries:
             max_jump = max(jump for _j, jump in boundaries)
-            if max_jump >= 0.45:
-                cutoff = max(0.45, 0.62 * max_jump)
+            if max_jump >= 0.42:
+                cutoff = max(0.42, 0.62 * max_jump)
                 for j, jump in boundaries:
                     if jump >= cutoff:
                         detected_time = times[j]
