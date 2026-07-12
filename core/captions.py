@@ -478,3 +478,132 @@ def render_caption_overlays(
         overlays.append(CaptionOverlay(event.start, event.end, str(path)))
 
     return overlays
+
+
+# ====================== LEITURA DA LEGENDA QUEIMADA (OCR) ======================
+
+_OCR_LANGUAGE_MAP = {"pt": "por", "en": "eng", "es": "spa"}
+
+
+def _ocr_grab_frame(video_path: str | Path, time_sec: float):
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+    try:
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, time_sec) * 1000.0)
+        ok, frame = cap.read()
+        return frame if ok else None
+    finally:
+        cap.release()
+
+
+def _ocr_variants(frame):
+    """Prepara duas versões do quadro: cinza puro e 'texto branco isolado'.
+
+    Legendas de reels costumam ser texto branco com contorno preto. Isolar os
+    pixels quase brancos remove o fundo e melhora muito o reconhecimento.
+    """
+    import cv2
+    import numpy as np
+
+    height, width = frame.shape[:2]
+    if width < 1000:
+        scale = 1000.0 / width
+        frame = cv2.resize(frame, (1000, int(round(height * scale))), interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    white = (gray >= 200).astype(np.uint8) * 255
+    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    isolated = 255 - white
+    return [gray, isolated]
+
+
+def _ocr_frame(image, lang: str) -> tuple[str, float]:
+    import pytesseract
+    from pytesseract import Output
+
+    data = pytesseract.image_to_data(image, lang=lang, config="--psm 6", output_type=Output.DICT)
+    lines: dict[tuple[int, int, int], list[str]] = {}
+    confidences: list[float] = []
+    for index in range(len(data["text"])):
+        token = (data["text"][index] or "").strip()
+        try:
+            confidence = float(data["conf"][index])
+        except (TypeError, ValueError):
+            continue
+        if not token or confidence < 55:
+            continue
+        if not re.search(r"[\wÀ-ÿ]", token):
+            continue
+        key = (data["block_num"][index], data["par_num"][index], data["line_num"][index])
+        lines.setdefault(key, []).append(token)
+        confidences.append(confidence)
+
+    text = "\n".join(" ".join(words) for _key, words in sorted(lines.items())).strip()
+    average = sum(confidences) / len(confidences) if confidences else 0.0
+    return text, average
+
+
+def read_burned_caption(
+    video_path: str | Path,
+    duration: float,
+    *,
+    language: str = "",
+) -> tuple[str, float]:
+    """Lê o texto escrito (queimado) nos quadros do primeiro take.
+
+    Amostra 5 quadros espalhados pelo take, roda OCR em duas versões de cada um
+    e escolhe por votação o texto mais consistente. Retorna (texto, confiança%).
+    Emojis não são reconhecidos por OCR e ficam de fora do texto lido.
+    """
+    try:
+        import pytesseract
+    except ImportError as exc:
+        raise MediaError(
+            "A leitura da legenda do vídeo requer o pacote 'pytesseract'. "
+            "Execute 'pip install -r requirements.txt'."
+        ) from exc
+
+    try:
+        available = set(pytesseract.get_languages(config=""))
+    except Exception as exc:
+        raise MediaError(
+            "O programa Tesseract OCR não foi encontrado. No Docker/Railway ele é instalado "
+            "automaticamente; no Windows instale em https://github.com/UB-Mannheim/tesseract/wiki."
+        ) from exc
+
+    preferred = _OCR_LANGUAGE_MAP.get((language or "").strip().lower())
+    langs = [code for code in [preferred, "por", "eng"] if code and code in available]
+    lang = "+".join(dict.fromkeys(langs)) or "eng"
+
+    results: list[tuple[str, float]] = []
+    for fraction in (0.15, 0.30, 0.50, 0.70, 0.85):
+        frame = _ocr_grab_frame(video_path, duration * fraction)
+        if frame is None:
+            continue
+        for variant in _ocr_variants(frame):
+            try:
+                text, confidence = _ocr_frame(variant, lang)
+            except Exception as exc:
+                raise MediaError(f"Falha ao ler a legenda do vídeo: {exc}") from exc
+            if text:
+                results.append((text, confidence))
+
+    if not results:
+        return "", 0.0
+
+    def _normalized(value: str) -> str:
+        return re.sub(r"\s+", " ", value.lower()).strip()
+
+    counts: dict[str, int] = {}
+    for text, _confidence in results:
+        key = _normalized(text)
+        counts[key] = counts.get(key, 0) + 1
+    winner = max(counts, key=lambda key: (counts[key], len(key)))
+    best = max(
+        (item for item in results if _normalized(item[0]) == winner),
+        key=lambda item: item[1],
+    )
+    return best
