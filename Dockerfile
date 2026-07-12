@@ -13,6 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core \
     fonts-noto-core \
     fonts-noto-color-emoji \
+    tesseract-ocr \
+    tesseract-ocr-por \
+    tesseract-ocr-eng \
+    tesseract-ocr-spa \
     libgl1 \
     libglib2.0-0 \
     && fc-cache -f \
