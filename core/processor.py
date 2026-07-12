@@ -109,11 +109,23 @@ def _build_filter_complex(
         source_label = f"caption{index}src"
         output_label = f"introcaption{index}"
         chains.append(f"[{input_index}:v]format=rgba[{source_label}]")
+        # A imagem da legenda entra em loop no FFmpeg. Sem shortest/trim, o filtro
+        # overlay pode prolongar o primeiro take indefinidamente e congelar seu
+        # último quadro, impedindo a concatenação com a continuação.
         chains.append(
             f"[{intro_label}][{source_label}]overlay=0:0:"
+            f"shortest=1:eof_action=pass:repeatlast=0:"
             f"enable='between(t,{overlay.start:.3f},{overlay.end:.3f})'[{output_label}]"
         )
         intro_label = output_label
+
+    # Garantia adicional: independentemente das camadas aplicadas, o primeiro
+    # segmento termina exatamente no segundo da troca.
+    chains.append(
+        f"[{intro_label}]trim=duration={intro_duration:.6f},"
+        f"setpts=PTS-STARTPTS[introready]"
+    )
+    intro_label = "introready"
 
     if has_continuation:
         chains.append(f"[1:v]trim=start={transition:.6f},setpts=PTS-STARTPTS[contsrc]")
