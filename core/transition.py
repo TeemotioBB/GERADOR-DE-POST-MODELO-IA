@@ -213,7 +213,30 @@ def _detect_static_take_end(
         if confirmed < required:
             continue
 
-        detected = max(min_time, time_sec)
+        # Refinamento: a divergência pode começar ANTES do corte de verdade
+        # (a pessoa levanta um produto, se aproxima da câmera etc. e logo em
+        # seguida vem o corte). Se existir um salto quadro-a-quadro dominante
+        # logo à frente, a transição é encaixada nele — senão sobra ~1s da
+        # cena original no vídeo final.
+        refine_end = index
+        refine_limit = time_sec + 2.2
+        while refine_end + 1 < total and times[refine_end + 1] <= refine_limit:
+            refine_end += 1
+        boundaries: list[tuple[int, float]] = []
+        for j in range(max(1, index), refine_end + 1):
+            jump = _feature_score(frames[j - 1], frames[j], hists[j - 1], hists[j])[0]
+            boundaries.append((j, jump))
+        detected_time = time_sec
+        if boundaries:
+            max_jump = max(jump for _j, jump in boundaries)
+            if max_jump >= 0.45:
+                cutoff = max(0.45, 0.62 * max_jump)
+                for j, jump in boundaries:
+                    if jump >= cutoff:
+                        detected_time = times[j]
+                        break
+
+        detected = max(min_time, detected_time)
         return TransitionResult(
             round(detected, 3),
             min(0.99, 0.55 + score),
