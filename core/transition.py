@@ -130,42 +130,96 @@ def _load_samples(
 def _detect_static_take_end(
     times: list[float],
     frames: list[np.ndarray],
+    hists: list[np.ndarray],
     *,
     min_time: float,
 ) -> TransitionResult | None:
+    """Encontra o fim do primeiro take quando ele é (quase) estático.
+
+    A versão anterior aceitava qualquer pico de diferença que durasse ~0.2s.
+    Um gesto de mão, o rosto se aproximando ou o celular balançando disparavam
+    a "troca" ainda dentro do primeiro take — e a modelo original reaparecia
+    no vídeo final. A regra nova: um corte de verdade muda a cena inteira e a
+    cena antiga NUNCA volta. Um gesto vai e volta. Então cada candidato só é
+    aceito se os quadros seguintes permanecerem diferentes da referência até
+    o fim da janela analisada.
+    """
     initial = [frame for time_sec, frame in zip(times, frames) if time_sec <= 0.55]
     if not initial:
         return None
     reference = np.median(np.stack(initial), axis=0).astype(np.uint8)
+    reference_hist = _gray_hist(reference)
 
-    consecutive = 0
-    first_candidate: float | None = None
+    def features(index: int) -> tuple[float, float, float, float]:
+        global_ratio, mean_diff, spatial = _difference_features(reference, frames[index])
+        hist_distance = _hist_distance(reference_hist, hists[index])
+        return global_ratio, mean_diff, spatial, hist_distance
+
+    def is_scene_change(global_ratio: float, mean_diff: float, spatial: float, hist_distance: float) -> bool:
+        # Mudança de cena inteira, não um objeto passando na frente.
+        return (
+            (spatial >= 0.55 and global_ratio >= 0.30)
+            or (hist_distance >= 0.45 and global_ratio >= 0.22 and spatial >= 0.35)
+            or (spatial >= 0.45 and hist_distance >= 0.32 and global_ratio >= 0.25 and mean_diff >= 0.06)
+        )
+
+    def still_changed(global_ratio: float, spatial: float, hist_distance: float) -> bool:
+        # Depois do corte a cena pode ter movimento, então o critério de
+        # permanência é um pouco mais tolerante do que o de disparo.
+        return spatial >= 0.30 and (global_ratio >= 0.18 or hist_distance >= 0.28)
+
+    def returned_to_intro(global_ratio: float, spatial: float, hist_distance: float) -> bool:
+        return global_ratio < 0.08 and spatial < 0.12 and hist_distance < 0.10
+
     strongest = 0.0
-    for time_sec, current in zip(times, frames):
+    total = len(frames)
+    for index in range(total):
+        time_sec = times[index]
         if time_sec < min_time:
             continue
-        global_ratio, mean_diff, spatial = _difference_features(reference, current)
-        score = 0.45 * spatial + 0.35 * global_ratio + 0.20 * min(mean_diff * 3.0, 1.0)
-        strongest = max(strongest, score)
-        changed_take = (
-            spatial >= 0.30
-            or global_ratio >= 0.30
-            or (spatial >= 0.20 and global_ratio >= 0.16 and mean_diff >= 0.09)
+        global_ratio, mean_diff, spatial, hist_distance = features(index)
+        score = (
+            0.40 * spatial
+            + 0.30 * global_ratio
+            + 0.15 * min(mean_diff * 3.0, 1.0)
+            + 0.15 * min(hist_distance * 1.5, 1.0)
         )
-        if changed_take:
-            if consecutive == 0:
-                first_candidate = time_sec
-            consecutive += 1
-            if consecutive >= 2:
-                detected = max(min_time, first_candidate or time_sec)
-                return TransitionResult(
-                    round(detected, 3),
-                    min(0.99, 0.55 + score),
-                    f"Troca do take estático detectada em {detected:.2f}s.",
-                )
-        else:
-            consecutive = 0
-            first_candidate = None
+        strongest = max(strongest, score)
+        if not is_scene_change(global_ratio, mean_diff, spatial, hist_distance):
+            continue
+
+        # Verificação de permanência: olha até 1.6s à frente (ou até o fim).
+        lookahead_end = time_sec + 1.6
+        checked = 0
+        confirmed = 0
+        came_back = False
+        for future_index in range(index + 1, total):
+            if times[future_index] > lookahead_end:
+                break
+            f_global, _f_mean, f_spatial, f_hist = features(future_index)
+            checked += 1
+            if still_changed(f_global, f_spatial, f_hist):
+                confirmed += 1
+            if returned_to_intro(f_global, f_spatial, f_hist):
+                came_back = True
+                break
+
+        if came_back:
+            continue
+        # Perto do fim da janela pode haver poucos quadros; exige o que existir.
+        if not checked:
+            continue
+        required = max(2, int(np.ceil(checked * 0.85)))
+        if confirmed < required:
+            continue
+
+        detected = max(min_time, time_sec)
+        return TransitionResult(
+            round(detected, 3),
+            min(0.99, 0.55 + score),
+            f"Troca do take estático detectada em {detected:.2f}s.",
+        )
+
     return TransitionResult(None, max(0.0, min(strongest, 0.49)), "")
 
 
@@ -333,7 +387,19 @@ def detect_intro_end(
 
     looks_static = _intro_looks_static(times, frames)
     if looks_static:
-        result = _detect_static_take_end(times, frames, min_time=min_time)
+        result = _detect_static_take_end(times, frames, hists, min_time=min_time)
+        # Se o caminho estático não achou nada, tenta o detector de movimento:
+        # cobre casos em que o começo parece parado mas o take tem movimento depois.
+        if result is None or result.seconds is None:
+            moving = _detect_moving_take_end(
+                times,
+                frames,
+                hists,
+                min_time=min_time,
+                sample_rate=sample_rate,
+            )
+            if moving and moving.seconds is not None:
+                result = moving
     else:
         result = _detect_moving_take_end(
             times,
