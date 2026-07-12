@@ -8,7 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .captions import CaptionEvent, CaptionOverlay, manual_caption, render_caption_overlays, transcribe_intro
+from .captions import (
+    CaptionEvent,
+    CaptionOverlay,
+    manual_caption,
+    read_burned_caption,
+    render_caption_overlays,
+    transcribe_intro,
+)
 from .config import (
     BACKGROUND_BLUR_DIVISOR,
     FFMPEG_THREADS,
@@ -211,7 +218,15 @@ def _build_filter_complex(
     intro_label = "introready"
 
     if has_continuation:
-        chains.append(f"[1:v]trim=start={transition:.6f},setpts=PTS-STARTPTS[contsrc]")
+        # Margem de segurança de ~2 quadros: vídeos de celular (VFR) podem ter
+        # timestamps levemente imprecisos e deixar 1-2 quadros da cena antiga
+        # "vazarem" no início da continuação. Pular 0.07s do vídeo original a
+        # partir da troca elimina isso sem efeito visível no take de continuação.
+        safety_margin = 0.07
+        continuation_start = min(transition + safety_margin, max(transition, duration - 0.05))
+        chains.append(
+            f"[1:v]trim=start={continuation_start:.6f},setpts=PTS-STARTPTS[contsrc]"
+        )
         fit_chain, cont_label = _fit_filter("contsrc", width, height, fps, fit_mode)
         chains.append(fit_chain)
         chains.append(f"[{intro_label}][{cont_label}]concat=n=2:v=1:a=0[vout]")
@@ -327,6 +342,23 @@ def process_video(
         )
         if not caption_events:
             transcript_summary = "O Whisper não encontrou fala clara no primeiro trecho."
+    elif caption_mode == "Copiar o texto escrito no vídeo original":
+        _safe_progress(progress, 0.30, "Lendo a legenda escrita no primeiro take...")
+        ocr_text, ocr_confidence = read_burned_caption(
+            video_path,
+            intro_duration,
+            language=language or "pt",
+        )
+        if not ocr_text:
+            raise MediaError(
+                "Não foi possível ler nenhuma legenda escrita no primeiro take. "
+                "Use 'Usar um texto fixo' e digite a legenda manualmente."
+            )
+        caption_events = manual_caption(ocr_text, intro_duration)
+        transcript_summary = (
+            f"Legenda lida do vídeo original (confiança {ocr_confidence:.0f}%):\n{ocr_text}\n"
+            "Emojis não são reconhecidos pelo OCR; se a original tiver emoji, use o texto fixo."
+        )
     elif caption_mode == "Usar um texto fixo":
         caption_events = manual_caption(manual_caption_text, intro_duration)
         if not caption_events:
