@@ -139,6 +139,11 @@ with gr.Blocks(title=APP_NAME) as demo:
 
             analyze_button = gr.Button("Analisar troca do take", variant="secondary")
             analysis_result = gr.Markdown()
+            gr.Markdown(
+                "**Dica**: se aparecer um pedacinho da modelo original no resultado, use o modo "
+                "manual e informe o segundo exato da troca (o botão acima mostra o segundo detectado).",
+                elem_classes=["small-note"],
+            )
 
         with gr.Column(scale=1):
             transition_mode = gr.Radio(
@@ -170,6 +175,7 @@ with gr.Blocks(title=APP_NAME) as demo:
             caption_mode = gr.Radio(
                 choices=[
                     "Transcrever o áudio automaticamente",
+                    "Copiar o texto escrito no vídeo original",
                     "Usar um texto fixo",
                     "Sem legenda",
                 ],
