@@ -1,0 +1,10 @@
+gradio>=6.0,<7
+fastapi>=0.120,<1
+uvicorn[standard]>=0.35,<1
+opencv-python-headless>=4.10,<5
+Pillow>=11,<13
+numpy>=2,<3
+faster-whisper>=1.1,<2
+python-multipart>=0.0.20,<1
+
+regex>=2025.0,<2027
