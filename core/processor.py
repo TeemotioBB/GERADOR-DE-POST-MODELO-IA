@@ -80,6 +80,89 @@ def _fit_filter(label: str, width: int, height: int, fps: float, mode: str) -> t
     return chain, "cont"
 
 
+def _render_normalized_intro(
+    media: PreparedIntroMedia,
+    output_path: Path,
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    duration: float,
+) -> None:
+    """Cria um MP4 sem áudio contendo somente a nova mídia do primeiro take.
+
+    A normalização em uma etapa separada evita que timestamps, rotação, VFR,
+    codecs de celular ou o uso de ``-stream_loop`` interfiram na concatenação
+    final e façam o vídeo original aparecer no lugar da mídia enviada.
+    """
+    ffmpeg = require_binary("ffmpeg")
+    fps_text = f"{fps:.6f}".rstrip("0").rstrip(".")
+
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+    ]
+    if media.kind == "image":
+        command.extend([
+            "-loop",
+            "1",
+            "-framerate",
+            fps_text,
+            "-i",
+            media.input_path,
+        ])
+    else:
+        # Repete somente o vídeo novo quando ele for menor que o primeiro take.
+        command.extend(["-stream_loop", "-1", "-i", media.input_path])
+
+    filter_graph = (
+        f"[0:v]trim=duration={duration:.6f},setpts=PTS-STARTPTS,"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"setsar=1,settb=AVTB,fps={fps_text},format=yuv420p[vintro]"
+    )
+
+    command.extend([
+        "-filter_threads",
+        str(FFMPEG_THREADS),
+        "-filter_complex_threads",
+        str(FFMPEG_THREADS),
+        "-filter_complex",
+        filter_graph,
+        "-map",
+        "[vintro]",
+        "-t",
+        f"{duration:.6f}",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        OUTPUT_PRESET,
+        "-crf",
+        str(OUTPUT_CRF),
+        "-pix_fmt",
+        "yuv420p",
+        "-threads",
+        str(FFMPEG_THREADS),
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ])
+
+    run_command(command, timeout=max(180, int(duration * 20)))
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        raise MediaError("Não foi possível preparar o vídeo enviado para o primeiro take.")
+
+    normalized = probe_video(output_path)
+    if normalized.duration + 0.08 < duration:
+        raise MediaError(
+            "O vídeo enviado para o primeiro take terminou antes do esperado durante a preparação."
+        )
+
+
 def _build_filter_complex(
     *,
     width: int,
@@ -169,19 +252,6 @@ def _resolve_transition(
     return transition, detected, True
 
 
-def _intro_input_args(media: PreparedIntroMedia, fps: float) -> list[str]:
-    if media.kind == "image":
-        return [
-            "-loop",
-            "1",
-            "-framerate",
-            f"{fps:.6f}",
-            "-i",
-            media.input_path,
-        ]
-    # Um vídeo curto é repetido automaticamente até preencher o primeiro take.
-    return ["-stream_loop", "-1", "-i", media.input_path]
-
 
 def process_video(
     *,
@@ -211,6 +281,7 @@ def process_video(
     job_dir = WORK_ROOT / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=False)
     output_path = job_dir / "video_pronto.mp4"
+    normalized_intro_path = job_dir / "primeiro_take_normalizado.mp4"
 
     _safe_progress(progress, 0.04, "Lendo os arquivos...")
     info = probe_video(video_path)
@@ -273,7 +344,17 @@ def process_video(
         )
 
     media_word = "vídeo" if intro_media.kind == "video" else "imagem"
-    _safe_progress(progress, 0.52, f"Montando o {media_word}, a legenda e o vídeo de continuação...")
+    _safe_progress(progress, 0.46, f"Preparando o {media_word} enviado para o primeiro take...")
+    _render_normalized_intro(
+        intro_media,
+        normalized_intro_path,
+        width=output_w,
+        height=output_h,
+        fps=info.fps,
+        duration=intro_duration,
+    )
+
+    _safe_progress(progress, 0.60, "Juntando o novo primeiro take ao vídeo original...")
     filter_complex, video_label, audio_label = _build_filter_complex(
         width=output_w,
         height=output_h,
@@ -298,7 +379,9 @@ def process_video(
         "-filter_complex_threads",
         str(FFMPEG_THREADS),
     ]
-    command.extend(_intro_input_args(intro_media, info.fps))
+    # O input 0 é sempre o trecho já normalizado da nova mídia. O original
+    # permanece exclusivamente no input 1 e só é usado após a transição.
+    command.extend(["-i", str(normalized_intro_path)])
     command.extend(["-i", str(video_path)])
     for overlay in caption_overlays:
         command.extend([
@@ -363,7 +446,10 @@ def process_video(
     else:
         structure_line = f"- A nova mídia permanece durante os {info.duration:.2f}s do vídeo."
 
-    media_line = f"- Mídia inicial reconhecida automaticamente: **{media_word}**."
+    media_line = (
+        f"- Mídia inicial reconhecida automaticamente: **{media_word}**.\n"
+        "- O primeiro take foi normalizado separadamente antes da junção, garantindo que o vídeo original só apareça após a troca."
+    )
     loop_line = ""
     if intro_media.kind == "video":
         source_duration = intro_media.duration or 0.0
