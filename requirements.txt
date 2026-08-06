@@ -10,4 +10,5 @@ python-multipart>=0.0.20,<1
 regex>=2025.0,<2027
 pytesseract>=0.3,<1
 
-yt-dlp>=2024.1,<2025
+# A faixa anterior (<2025) prendia o projeto a um extrator antigo do Instagram.
+yt-dlp[default]>=2026.6.9,<2027
