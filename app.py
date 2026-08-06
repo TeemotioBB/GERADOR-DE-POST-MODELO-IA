@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import os
-import shutil
 import uuid
+import json
 from pathlib import Path
 
 import gradio as gr
@@ -10,11 +10,11 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from core.config import APP_NAME, MAX_INSTAGRAM_DOWNLOAD_MB, MAX_VIDEO_MINUTES, WORK_ROOT
-from core.instagram_import import InstagramImportError, baixar_video_instagram
+from core.config import APP_NAME, WORK_ROOT
 from core.media import MediaError, probe_video
 from core.processor import cleanup_old_jobs, process_video
 from core.transition import detect_intro_end
+import url_import
 
 cleanup_old_jobs()
 
@@ -24,9 +24,10 @@ CSS = """
 .hero h1 {margin-bottom: 6px !important;}
 .small-note {font-size: 0.92rem; opacity: 0.82;}
 #generate-btn {min-height: 48px; font-weight: 700;}
-#import-instagram-btn {min-height: 44px; font-weight: 700;}
-.import-box {padding: 14px; border: 1px solid var(--border-color-primary); border-radius: 14px;}
 """
+
+# Cache de vídeos importados por URL (para evitar re-análise)
+IMPORTED_VIDEOS = {}
 
 
 def transition_visibility(choice: str):
@@ -37,52 +38,12 @@ def caption_visibility(choice: str):
     return gr.update(visible=choice == "Usar um texto fixo")
 
 
-
-def import_instagram_video(url: str, progress=gr.Progress()):
-    clean_url = (url or "").strip()
-    if not clean_url:
-        raise gr.Error("Cole o link do Reels do Instagram.")
-
-    cleanup_old_jobs()
-    import_id = uuid.uuid4().hex
-    import_dir = Path(WORK_ROOT) / f"instagram_{import_id}"
-    import_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        progress(0.02, desc="Preparando a importação...")
-        progress(0.08, desc="Baixando o Reels do Instagram...")
-        video_path, display_name = baixar_video_instagram(
-            url=clean_url,
-            pasta_destino=str(import_dir),
-            identificador=import_id,
-            limite_mb=MAX_INSTAGRAM_DOWNLOAD_MB,
-        )
-
-        progress(0.82, desc="Conferindo vídeo e áudio...")
-        info = probe_video(video_path)
-        if info.duration <= 0:
-            raise MediaError("A duração do vídeo importado é inválida.")
-        if info.duration > MAX_VIDEO_MINUTES * 60:
-            raise MediaError(
-                f"O vídeo importado tem {info.duration / 60:.1f} minutos. "
-                f"O limite configurado é {MAX_VIDEO_MINUTES:.0f} minutos."
-            )
-
-        progress(1.0, desc="Reels importado e pronto para editar.")
-        status = (
-            "✅ **Reels importado com sucesso.**  \n"
-            f"Arquivo: `{display_name}`  \n"
-            f"Duração: {info.duration:.2f}s · {info.width}×{info.height} · "
-            f"Áudio: {'sim' if info.has_audio else 'não'}  \n"
-            "O vídeo já foi colocado no campo 2. Agora você pode analisar ou gerar diretamente."
-        )
-        return video_path, status, ""
-    except (InstagramImportError, MediaError) as exc:
-        shutil.rmtree(import_dir, ignore_errors=True)
-        raise gr.Error(str(exc)) from exc
-    except Exception as exc:
-        shutil.rmtree(import_dir, ignore_errors=True)
-        raise gr.Error(f"Falha inesperada ao importar o Reels: {exc}") from exc
+def video_input_visibility(choice: str):
+    """Mostra/esconde os campos de upload/URL baseado na escolha."""
+    if choice == "Carregar arquivo local":
+        return gr.update(visible=True), gr.update(visible=False)
+    else:  # "Importar por URL"
+        return gr.update(visible=False), gr.update(visible=True)
 
 
 def analyze_video(video_path: str | None):
@@ -119,6 +80,27 @@ def analyze_video(video_path: str | None):
     return text, detected.seconds
 
 
+def importar_video_url(url: str):
+    """Importa vídeo por URL e retorna o caminho local."""
+    if not url or not url.strip():
+        raise gr.Error("Cole um link válido.")
+    
+    job_id = uuid.uuid4().hex
+    try:
+        caminho, nome = url_import.baixar_video(
+            url=url,
+            pasta_destino=str(WORK_ROOT),
+            identificador=job_id,
+            limite_mb=500,  # Ajuste conforme seu limite
+        )
+        IMPORTED_VIDEOS[job_id] = {"path": caminho, "nome": nome}
+        return caminho
+    except url_import.VideoImportError as e:
+        raise gr.Error(str(e)) from e
+    except Exception as e:
+        raise gr.Error(f"Falha ao importar: {e}") from e
+
+
 def generate_video(
     intro_media_path: str | None,
     video_path: str | None,
@@ -141,8 +123,6 @@ def generate_video(
 
     try:
         result = process_video(
-            # O nome photo_path é mantido internamente para não quebrar integrações antigas,
-            # mas agora esse campo aceita tanto imagem quanto vídeo.
             photo_path=intro_media_path or "",
             video_path=video_path or "",
             transition_mode=transition_mode,
@@ -180,27 +160,39 @@ with gr.Blocks(title=APP_NAME) as demo:
                 file_types=["image", "video"],
                 type="filepath",
             )
-            video = gr.File(
+            
+            # === NOVA SEÇÃO: Escolher entre upload local ou URL ===
+            video_input_mode = gr.Radio(
+                choices=[
+                    "Carregar arquivo local",
+                    "Importar por URL",
+                ],
+                value="Carregar arquivo local",
+                label="Como adicionar o vídeo original?",
+            )
+            
+            # Arquivo local
+            video_upload = gr.File(
                 label="2. Vídeo original com áudio e possível continuação",
                 file_types=["video"],
                 type="filepath",
+                visible=True,
             )
-            with gr.Group(elem_classes=["import-box"]):
-                gr.Markdown(
-                    "**Ou importe o vídeo direto pelo link do Instagram**",
-                    elem_classes=["small-note"],
+            
+            # URL
+            with gr.Group(visible=False) as video_url_group:
+                gr.Markdown("**Cole o link do vídeo** (Instagram, TikTok, YouTube, Twitter/X, etc.)")
+                video_url = gr.Textbox(
+                    label="URL do vídeo",
+                    placeholder="https://www.instagram.com/reel/...",
+                    lines=2,
                 )
-                instagram_url = gr.Textbox(
-                    label="Link do Reels",
-                    placeholder="https://www.instagram.com/reel/XXXXXXXXXXX/",
-                    lines=1,
-                )
-                import_instagram_button = gr.Button(
-                    "IMPORTAR VÍDEO PELO LINK",
-                    variant="secondary",
-                    elem_id="import-instagram-btn",
-                )
-                import_status = gr.Markdown()
+                import_button = gr.Button("📥 Importar vídeo", variant="secondary")
+                import_status = gr.Markdown(visible=False)
+            
+            # Armazena o caminho do vídeo (local ou importado)
+            video_path_state = gr.State(value=None)
+            
             gr.Markdown(
                 "A proporção final segue a primeira mídia. Se ela for um vídeo curto, ele será repetido até a troca do take; se for longo, será cortado no ponto da troca.",
                 elem_classes=["small-note"],
@@ -286,32 +278,78 @@ with gr.Blocks(title=APP_NAME) as demo:
             report = gr.Markdown()
             transition_used = gr.Number(label="Segundo da transição usado", interactive=False)
 
-    transition_mode.change(
-        fn=transition_visibility,
-        inputs=transition_mode,
-        outputs=manual_transition,
+    # === LÓGICA DE EVENTOS ===
+    
+    # Ao mudar modo de entrada, mostra/esconde campos
+    video_input_mode.change(
+        fn=video_input_visibility,
+        inputs=video_input_mode,
+        outputs=[video_upload, video_url_group],
     )
-    caption_mode.change(
-        fn=caption_visibility,
-        inputs=caption_mode,
-        outputs=manual_caption,
+    
+    # Quando arquivo local é selecionado, armazena no state
+    video_upload.change(
+        fn=lambda x: x,
+        inputs=video_upload,
+        outputs=video_path_state,
     )
-    import_instagram_button.click(
-        fn=import_instagram_video,
-        inputs=instagram_url,
-        outputs=[video, import_status, instagram_url],
-        api_name="import_instagram",
+    
+    # Quando URL é importada
+    def handle_url_import(url):
+        caminho = importar_video_url(url)
+        return (
+            gr.update(value="✅ Vídeo importado com sucesso!", visible=True),
+            caminho,
+        )
+    
+    import_button.click(
+        fn=handle_url_import,
+        inputs=video_url,
+        outputs=[import_status, video_path_state],
     )
+    
+    # Análise do vídeo
+    def analyze_wrapper():
+        video_path = video_path_state.value
+        return analyze_video(video_path)
+    
     analyze_button.click(
-        fn=analyze_video,
-        inputs=video,
+        fn=analyze_wrapper,
         outputs=[analysis_result, manual_transition],
     )
+    
+    # Geração
+    def generate_wrapper(
+        intro_media_path,
+        transition_mode,
+        manual_transition_seconds,
+        caption_mode,
+        manual_caption_text,
+        caption_position,
+        caption_font_percent,
+        continuation_fit_mode,
+        language_label,
+        progress=gr.Progress(),
+    ):
+        video_path = video_path_state.value
+        return generate_video(
+            intro_media_path,
+            video_path,
+            transition_mode,
+            manual_transition_seconds,
+            caption_mode,
+            manual_caption_text,
+            caption_position,
+            caption_font_percent,
+            continuation_fit_mode,
+            language_label,
+            progress,
+        )
+    
     generate_button.click(
-        fn=generate_video,
+        fn=generate_wrapper,
         inputs=[
             intro_media,
-            video,
             transition_mode,
             manual_transition,
             caption_mode,
@@ -323,6 +361,18 @@ with gr.Blocks(title=APP_NAME) as demo:
         ],
         outputs=[output_video, report, transition_used],
         api_name="generate",
+    )
+    
+    # Outros eventos
+    transition_mode.change(
+        fn=transition_visibility,
+        inputs=transition_mode,
+        outputs=manual_transition,
+    )
+    caption_mode.change(
+        fn=caption_visibility,
+        inputs=caption_mode,
+        outputs=manual_caption,
     )
 
 
@@ -344,8 +394,31 @@ def api_info():
         "status": "online",
         "intro_media": ["image", "video"],
         "emoji_captions": True,
-        "instagram_import": True,
+        "url_import": True,
     }
+
+
+@fastapi_app.post("/api/import-video")
+def api_import_video(data: dict):
+    """API para importar vídeo por URL (para integração com outros apps)."""
+    url = (data.get("url") or "").strip()
+    if not url:
+        return {"erro": "URL não fornecida"}, 400
+    
+    job_id = uuid.uuid4().hex
+    try:
+        caminho, nome = url_import.baixar_video(
+            url=url,
+            pasta_destino=str(WORK_ROOT),
+            identificador=job_id,
+            limite_mb=500,
+        )
+        IMPORTED_VIDEOS[job_id] = {"path": caminho, "nome": nome}
+        return {"id": job_id, "caminho": caminho, "nome": nome}
+    except url_import.VideoImportError as e:
+        return {"erro": str(e)}, 400
+    except Exception as e:
+        return {"erro": f"Falha ao importar: {e}"}, 500
 
 
 username = os.getenv("APP_USERNAME", "").strip()
