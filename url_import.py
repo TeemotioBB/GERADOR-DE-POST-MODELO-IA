@@ -277,3 +277,21 @@ def baixar_video_instagram(
     nome = re.sub(r"[^A-Za-z0-9._-]+", "_", titulo).strip("._")[:80]
     nome = nome or "reel_instagram"
     return str(arquivo), f"{nome}.mp4"
+
+# Compatibilidade com os nomes esperados pelo app.py.
+VideoImportError = InstagramImportError
+
+
+def baixar_video(
+    url: str,
+    pasta_destino: str,
+    identificador: str,
+    limite_mb: int = 200,
+) -> tuple[str, str]:
+    """Alias compatível para a importação do Instagram."""
+    return baixar_video_instagram(
+        url=url,
+        pasta_destino=pasta_destino,
+        identificador=identificador,
+        limite_mb=limite_mb,
+    )
