@@ -3,12 +3,12 @@
 Importação genérica de vídeos por URL usando yt-dlp.
 
 Aceita URLs de Instagram, TikTok, YouTube, Twitter/X e outros sites.
-Implementa fallback com cookies para casos onde o servidor está bloqueado.
+Tenta primeiro sem autenticação e repete com cookies quando disponíveis.
 
-Variáveis aceitas:
-- COOKIES_B64: conteúdo de cookies.txt codificado em Base64
-- COOKIES: conteúdo bruto do cookies.txt no formato Netscape
-- FORCE_IPV4: "1" para forçar IPv4
+Variáveis aceitas (os dois padrões são reconhecidos):
+- COOKIES_B64 ou INSTAGRAM_COOKIES_B64
+- COOKIES ou INSTAGRAM_COOKIES
+- FORCE_IPV4 ou INSTAGRAM_FORCE_IPV4: "1" para forçar IPv4
 """
 
 from __future__ import annotations
@@ -25,6 +25,28 @@ import yt_dlp
 
 class VideoImportError(RuntimeError):
     """Erro esperado e seguro para mostrar ao usuário."""
+
+
+_DOMINIOS_INSTAGRAM = {
+    "instagram.com",
+    "www.instagram.com",
+    "m.instagram.com",
+}
+
+
+def _primeira_variavel_preenchida(*nomes: str) -> str:
+    for nome in nomes:
+        valor = os.environ.get(nome, "").strip()
+        if valor:
+            return valor
+    return ""
+
+
+def _url_eh_instagram(url: str) -> bool:
+    try:
+        return (urlparse(url).hostname or "").lower() in _DOMINIOS_INSTAGRAM
+    except Exception:
+        return False
 
 
 def normalizar_url(url: str) -> str:
@@ -45,6 +67,12 @@ def normalizar_url(url: str) -> str:
     if not host:
         raise VideoImportError("Use um link válido.")
 
+    # Remove parâmetros como ?igsh= dos links do Instagram. Eles não são
+    # necessários para o download e às vezes atrapalham a identificação.
+    if host in _DOMINIOS_INSTAGRAM:
+        caminho = parsed.path.rstrip("/")
+        return f"https://www.instagram.com{caminho}/"
+
     return url
 
 
@@ -52,17 +80,26 @@ def _criar_arquivo_cookies_temporario() -> str | None:
     """Cria cookies.txt temporário a partir das variáveis de ambiente."""
     conteudo: str | None = None
 
-    cookies_b64 = os.environ.get("COOKIES_B64", "").strip()
-    cookies_raw = os.environ.get("COOKIES", "").strip()
+    # Compatibilidade com os nomes usados no projeto antigo e no .env atual.
+    cookies_b64 = _primeira_variavel_preenchida(
+        "COOKIES_B64",
+        "INSTAGRAM_COOKIES_B64",
+    )
+    cookies_raw = _primeira_variavel_preenchida(
+        "COOKIES",
+        "INSTAGRAM_COOKIES",
+    )
 
     if cookies_b64:
         try:
             conteudo = base64.b64decode(cookies_b64, validate=True).decode("utf-8")
         except Exception as exc:
             raise VideoImportError(
-                "A variável COOKIES_B64 está inválida. Gere novamente o Base64 do cookies.txt."
+                "A variável de cookies em Base64 está inválida. "
+                "Exporte novamente o cookies.txt e gere um novo Base64."
             ) from exc
     elif cookies_raw:
+        # Railway pode armazenar as quebras de linha como os caracteres \n.
         conteudo = cookies_raw.replace("\\n", "\n")
 
     if not conteudo:
@@ -88,11 +125,19 @@ def _criar_arquivo_cookies_temporario() -> str | None:
         arquivo.close()
 
 
-def _erro_pede_autenticacao(mensagem: str) -> bool:
-    """Detecta se o erro indica bloqueio/autenticação necessária."""
+def _erro_de_limite(mensagem: str) -> bool:
+    texto = mensagem.lower()
+    return "limite" in texto or "too large" in texto or "larger than" in texto
+
+
+def _erro_pede_autenticacao_ou_fallback(mensagem: str) -> bool:
+    """Detecta bloqueios e falhas de extração que podem ser resolvidas com cookies."""
     texto = mensagem.lower()
     sinais = (
         "empty media response",
+        "unable to extract video url",
+        "unable to extract username",
+        "no video formats found",
         "login",
         "log in",
         "cookies",
@@ -102,24 +147,48 @@ def _erro_pede_autenticacao(mensagem: str) -> bool:
         "not available in your country",
         "access denied",
         "forbidden",
+        "http error 401",
+        "http error 403",
+        "http error 429",
+        "too many requests",
     )
     return any(sinal in texto for sinal in sinais)
 
 
+def _forcar_ipv4() -> bool:
+    valor = _primeira_variavel_preenchida(
+        "FORCE_IPV4",
+        "INSTAGRAM_FORCE_IPV4",
+    )
+    return valor == "1"
+
+
 def _opcoes_yt_dlp(
+    url: str,
     template: str,
     limite_bytes: int,
     limite_mb: int,
     cookiefile: str | None,
 ) -> dict:
     """Configura opções do yt-dlp."""
-    
+
     def rejeitar_grande(info, *, incomplete=False):
         del incomplete
         tamanho = info.get("filesize") or info.get("filesize_approx")
         if tamanho and tamanho > limite_bytes:
             return f"O vídeo ultrapassa o limite de {limite_mb} MB."
         return None
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/150.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    if _url_eh_instagram(url):
+        headers["Referer"] = "https://www.instagram.com/"
 
     opcoes = {
         "outtmpl": template,
@@ -131,24 +200,17 @@ def _opcoes_yt_dlp(
         "socket_timeout": 35,
         "retries": 3,
         "fragment_retries": 3,
-        "extractor_retries": 2,
+        "extractor_retries": 3,
         "match_filter": rejeitar_grande,
         "restrictfilenames": True,
         "cachedir": False,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/150.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        },
+        "http_headers": headers,
     }
 
     if cookiefile:
         opcoes["cookiefile"] = cookiefile
 
-    if os.environ.get("FORCE_IPV4", "").strip() == "1":
+    if _forcar_ipv4():
         opcoes["source_address"] = "0.0.0.0"
 
     return opcoes
@@ -163,6 +225,7 @@ def _executar_download(
 ) -> dict:
     """Executa o download com yt-dlp."""
     opcoes = _opcoes_yt_dlp(
+        url=url,
         template=template,
         limite_bytes=limite_bytes,
         limite_mb=limite_mb,
@@ -180,9 +243,8 @@ def baixar_video(
 ) -> tuple[str, str]:
     """
     Baixa um vídeo por URL e retorna (caminho_do_arquivo, nome_para_download).
-    
-    Suporta: Instagram, TikTok, YouTube, Twitter/X e muitos outros.
-    Implementa fallback com cookies para IPs de servidor bloqueados.
+
+    Suporta Instagram, TikTok, YouTube, Twitter/X e muitos outros sites.
     """
     url_limpa = normalizar_url(url)
     pasta = Path(pasta_destino)
@@ -195,50 +257,64 @@ def baixar_video(
     info: dict | None = None
 
     try:
-        # Primeiro tenta anonimamente
         try:
+            # Primeira tentativa sem autenticação.
             info = _executar_download(
-                url_limpa, template, limite_bytes, limite_mb, cookiefile=None
+                url_limpa,
+                template,
+                limite_bytes,
+                limite_mb,
+                cookiefile=None,
             )
         except yt_dlp.utils.DownloadError as primeiro_erro:
             mensagem = str(primeiro_erro)
-            
-            if "limite" in mensagem.lower() or "too large" in mensagem.lower():
+
+            if _erro_de_limite(mensagem):
                 raise VideoImportError(
                     f"O vídeo ultrapassa o limite de {limite_mb} MB."
                 ) from primeiro_erro
 
-            if not _erro_pede_autenticacao(mensagem):
-                raise VideoImportError(
-                    "Não foi possível importar esse vídeo. Confirme o link e tente novamente."
-                ) from primeiro_erro
-
-            # Servidor bloqueado. Tenta com cookies.
+            # Tenta cookies sempre que estiverem configurados. Isso cobre também
+            # mudanças recentes do Instagram cuja mensagem ainda não está mapeada.
             cookiefile = _criar_arquivo_cookies_temporario()
             if not cookiefile:
+                if _url_eh_instagram(url_limpa) or _erro_pede_autenticacao_ou_fallback(mensagem):
+                    raise VideoImportError(
+                        "O Instagram recusou a extração anônima. Configure "
+                        "INSTAGRAM_COOKIES_B64 no Railway com um cookies.txt novo "
+                        "e faça um novo deploy."
+                    ) from primeiro_erro
                 raise VideoImportError(
-                    "O servidor bloqueou a importação. Configure a variável COOKIES_B64 "
-                    "e tente novamente."
+                    "Não foi possível importar esse vídeo. Confirme se o link é "
+                    "público e se o yt-dlp está atualizado."
                 ) from primeiro_erro
 
             try:
                 info = _executar_download(
-                    url_limpa, template, limite_bytes, limite_mb, cookiefile=cookiefile
+                    url_limpa,
+                    template,
+                    limite_bytes,
+                    limite_mb,
+                    cookiefile=cookiefile,
                 )
             except yt_dlp.utils.DownloadError as segundo_erro:
                 mensagem2 = str(segundo_erro)
-                if "limite" in mensagem2.lower() or "too large" in mensagem2.lower():
+                if _erro_de_limite(mensagem2):
                     raise VideoImportError(
                         f"O vídeo ultrapassa o limite de {limite_mb} MB."
                     ) from segundo_erro
-                if _erro_pede_autenticacao(mensagem2):
+
+                if _erro_pede_autenticacao_ou_fallback(mensagem2):
                     raise VideoImportError(
-                        "Os cookies expiraram ou foram recusados. "
-                        "Exporte um cookies.txt novo e atualize COOKIES_B64."
+                        "O Instagram recusou o download mesmo com cookies. "
+                        "Exporte um cookies.txt novo da conta logada, atualize "
+                        "INSTAGRAM_COOKIES_B64 e confirme que o Reels está acessível."
                     ) from segundo_erro
+
                 raise VideoImportError(
                     "O servidor recusou esse download mesmo com autenticação. "
-                    "Tente novamente mais tarde."
+                    "Confirme se o vídeo ainda existe e se é acessível pela conta "
+                    "usada para exportar os cookies."
                 ) from segundo_erro
 
         titulo = ((info or {}).get("title") or (info or {}).get("id") or "video").strip()
@@ -250,7 +326,6 @@ def baixar_video(
             except OSError:
                 pass
 
-    # Procura o arquivo MP4 baixado
     candidatos = sorted(pasta.glob(f"{identificador}_video.*"))
     arquivo = next((p for p in candidatos if p.suffix.lower() == ".mp4"), None)
     if arquivo is None:
@@ -273,11 +348,8 @@ def baixar_video(
             arquivo.unlink()
         except OSError:
             pass
-        raise VideoImportError(
-            f"O vídeo ultrapassa o limite de {limite_mb} MB."
-        )
+        raise VideoImportError(f"O vídeo ultrapassa o limite de {limite_mb} MB.")
 
-    # Gera nome para download (sanitizado)
     nome = re.sub(r"[^A-Za-z0-9._-]+", "_", titulo).strip("._")[:80]
     nome = nome or "video_importado"
     return str(arquivo), f"{nome}.mp4"
