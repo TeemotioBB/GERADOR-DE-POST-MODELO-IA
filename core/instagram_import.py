@@ -1,3 +1,16 @@
+#!/usr/bin/env python3
+"""Importação de Reels públicos do Instagram usando yt-dlp.
+
+O Instagram pode devolver uma resposta vazia para IPs de datacenter, mesmo
+quando o Reels é público. Este módulo tenta primeiro sem autenticação e, se
+necessário, repete usando cookies armazenados em variável do Railway.
+
+Variáveis aceitas:
+- INSTAGRAM_COOKIES_B64: conteúdo de cookies.txt codificado em Base64 (recomendado)
+- INSTAGRAM_COOKIES: conteúdo bruto do cookies.txt no formato Netscape
+- INSTAGRAM_FORCE_IPV4: "1" para forçar IPv4
+"""
+
 from __future__ import annotations
 
 import base64
@@ -5,93 +18,91 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Callable
 from urllib.parse import urlparse
 
 import yt_dlp
 
 
 class InstagramImportError(RuntimeError):
-    """Erro de importação que pode ser exibido diretamente na interface."""
+    """Erro esperado e seguro para mostrar ao usuário."""
 
 
-ProgressCallback = Callable[[float, str], None]
-
-_DOMAINS = {
+_DOMINIOS = {
     "instagram.com",
     "www.instagram.com",
     "m.instagram.com",
 }
-_REEL_PATH = re.compile(r"^/(?:reel|reels|p)/[A-Za-z0-9_-]+/?$")
+_PADRAO_REEL = re.compile(r"^/(?:reel|reels|p)/[A-Za-z0-9_-]+/?$")
 
 
-def normalize_instagram_url(url: str) -> str:
-    """Valida o link e remove parâmetros como ``igsh`` e UTMs."""
-    value = (url or "").strip()
-    if not value:
-        raise InstagramImportError("Cole o link do Reels do Instagram.")
+def normalizar_url_instagram(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        raise InstagramImportError("Cole o link do Reels.")
 
     try:
-        parsed = urlparse(value)
+        parsed = urlparse(url)
     except Exception as exc:
         raise InstagramImportError("Link do Instagram inválido.") from exc
 
     host = (parsed.hostname or "").lower()
-    if parsed.scheme not in {"http", "https"} or host not in _DOMAINS:
+    if parsed.scheme not in {"http", "https"} or host not in _DOMINIOS:
         raise InstagramImportError("Use um link válido do Instagram.")
 
-    path = parsed.path.rstrip("/")
-    if not _REEL_PATH.match(path):
+    caminho = parsed.path.rstrip("/")
+    if not _PADRAO_REEL.match(caminho):
         raise InstagramImportError(
-            "Esse endereço não parece ser um Reels ou uma publicação do Instagram."
+            "Esse link não parece ser de um Reels ou publicação do Instagram."
         )
 
-    return f"https://www.instagram.com{path}/"
+    # Remove ?igsh=, utm e demais parâmetros de rastreamento.
+    return f"https://www.instagram.com{caminho}/"
 
 
-def _create_cookie_file() -> str | None:
-    """Cria um cookies.txt temporário a partir das variáveis do Railway."""
-    content: str | None = None
-    cookies_b64 = os.getenv("INSTAGRAM_COOKIES_B64", "").strip()
-    cookies_raw = os.getenv("INSTAGRAM_COOKIES", "").strip()
+def _criar_arquivo_cookies_temporario() -> str | None:
+    """Cria cookies.txt temporário a partir das variáveis do Railway."""
+    conteudo: str | None = None
+
+    cookies_b64 = os.environ.get("INSTAGRAM_COOKIES_B64", "").strip()
+    cookies_raw = os.environ.get("INSTAGRAM_COOKIES", "").strip()
 
     if cookies_b64:
         try:
-            content = base64.b64decode(cookies_b64, validate=True).decode("utf-8")
+            conteudo = base64.b64decode(cookies_b64, validate=True).decode("utf-8")
         except Exception as exc:
             raise InstagramImportError(
                 "A variável INSTAGRAM_COOKIES_B64 está inválida. Gere novamente o Base64 do cookies.txt."
             ) from exc
     elif cookies_raw:
-        # Alguns painéis salvam quebras de linha como os caracteres literais \n.
-        content = cookies_raw.replace("\\n", "\n")
+        # Railway pode salvar quebras de linha como os caracteres literais \n.
+        conteudo = cookies_raw.replace("\\n", "\n")
 
-    if not content:
+    if not conteudo:
         return None
 
-    if "# Netscape HTTP Cookie File" not in content and "\t.instagram.com\t" not in content:
+    if "# Netscape HTTP Cookie File" not in conteudo and "\t.instagram.com\t" not in conteudo:
         raise InstagramImportError(
             "Os cookies do Instagram não parecem estar no formato Netscape cookies.txt."
         )
 
-    cookie_file = tempfile.NamedTemporaryFile(
+    arquivo = tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
         suffix="_instagram_cookies.txt",
         delete=False,
     )
     try:
-        cookie_file.write(content)
-        if not content.endswith("\n"):
-            cookie_file.write("\n")
-        return cookie_file.name
+        arquivo.write(conteudo)
+        if not conteudo.endswith("\n"):
+            arquivo.write("\n")
+        return arquivo.name
     finally:
-        cookie_file.close()
+        arquivo.close()
 
 
-def _looks_like_auth_error(message: str) -> bool:
-    text = message.lower()
-    signals = (
+def _erro_pede_autenticacao(mensagem: str) -> bool:
+    texto = mensagem.lower()
+    sinais = (
         "empty media response",
         "login",
         "log in",
@@ -99,48 +110,24 @@ def _looks_like_auth_error(message: str) -> bool:
         "authentication",
         "main webpage is locked behind the login page",
         "requested content is not available",
-        "rate-limit",
-        "rate limit",
-        "403",
-        "forbidden",
-        "429",
-        "no video formats",
-        "challenge",
     )
-    return any(signal in text for signal in signals)
+    return any(sinal in texto for sinal in sinais)
 
 
-def _download_options(
-    *,
+def _opcoes_yt_dlp(
     template: str,
-    max_bytes: int,
-    max_mb: int,
+    limite_bytes: int,
+    limite_mb: int,
     cookiefile: str | None,
-    progress_callback: ProgressCallback | None,
 ) -> dict:
-    def reject_large(info, *, incomplete=False):
+    def rejeitar_grande(info, *, incomplete=False):
         del incomplete
-        size = info.get("filesize") or info.get("filesize_approx")
-        if size and size > max_bytes:
-            return f"O vídeo ultrapassa o limite de {max_mb} MB."
+        tamanho = info.get("filesize") or info.get("filesize_approx")
+        if tamanho and tamanho > limite_bytes:
+            return f"O vídeo ultrapassa o limite de {limite_mb} MB."
         return None
 
-    def progress_hook(status: dict) -> None:
-        if progress_callback is None:
-            return
-        state = status.get("status")
-        if state == "downloading":
-            downloaded = float(status.get("downloaded_bytes") or 0)
-            total = float(status.get("total_bytes") or status.get("total_bytes_estimate") or 0)
-            if total > 0:
-                fraction = max(0.0, min(downloaded / total, 1.0))
-                progress_callback(fraction, f"Baixando o Reels... {fraction:.0%}")
-            else:
-                progress_callback(0.15, "Baixando o Reels do Instagram...")
-        elif state == "finished":
-            progress_callback(1.0, "Download concluído. Validando o vídeo...")
-
-    options = {
+    opcoes = {
         "outtmpl": template,
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
         "merge_output_format": "mp4",
@@ -151,11 +138,9 @@ def _download_options(
         "retries": 3,
         "fragment_retries": 3,
         "extractor_retries": 2,
-        "match_filter": reject_large,
+        "match_filter": rejeitar_grande,
         "restrictfilenames": True,
         "cachedir": False,
-        "overwrites": True,
-        "progress_hooks": [progress_hook],
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -167,106 +152,95 @@ def _download_options(
     }
 
     if cookiefile:
-        options["cookiefile"] = cookiefile
+        opcoes["cookiefile"] = cookiefile
 
-    if os.getenv("INSTAGRAM_FORCE_IPV4", "").strip() == "1":
-        options["source_address"] = "0.0.0.0"
+    if os.environ.get("INSTAGRAM_FORCE_IPV4", "").strip() == "1":
+        opcoes["source_address"] = "0.0.0.0"
 
-    return options
+    return opcoes
 
 
-def _execute_download(
-    *,
+def _executar_download(
     url: str,
     template: str,
-    max_bytes: int,
-    max_mb: int,
+    limite_bytes: int,
+    limite_mb: int,
     cookiefile: str | None,
-    progress_callback: ProgressCallback | None,
 ) -> dict:
-    options = _download_options(
+    opcoes = _opcoes_yt_dlp(
         template=template,
-        max_bytes=max_bytes,
-        max_mb=max_mb,
+        limite_bytes=limite_bytes,
+        limite_mb=limite_mb,
         cookiefile=cookiefile,
-        progress_callback=progress_callback,
     )
-    with yt_dlp.YoutubeDL(options) as ydl:
+    with yt_dlp.YoutubeDL(opcoes) as ydl:
         return ydl.extract_info(url, download=True)
 
 
-def download_instagram_video(
+def baixar_video_instagram(
     url: str,
-    destination_dir: str | Path,
-    identifier: str,
-    *,
-    max_mb: int = 500,
-    progress_callback: ProgressCallback | None = None,
+    pasta_destino: str,
+    identificador: str,
+    limite_mb: int = 200,
 ) -> tuple[str, str]:
-    """Baixa um Reels e retorna ``(caminho, nome_amigável)``."""
-    clean_url = normalize_instagram_url(url)
-    folder = Path(destination_dir)
-    folder.mkdir(parents=True, exist_ok=True)
+    """Baixa um Reels e retorna (caminho_do_arquivo, nome_para_download)."""
+    url_limpa = normalizar_url_instagram(url)
+    pasta = Path(pasta_destino)
+    pasta.mkdir(parents=True, exist_ok=True)
 
-    prefix = folder / f"{identifier}_instagram"
-    template = str(prefix) + ".%(ext)s"
-    max_bytes = int(max_mb) * 1024 * 1024
+    prefixo = pasta / f"{identificador}_instagram"
+    template = str(prefixo) + ".%(ext)s"
+    limite_bytes = int(limite_mb) * 1024 * 1024
     cookiefile: str | None = None
     info: dict | None = None
 
     try:
+        # Primeiro tenta anonimamente, evitando usar cookies sem necessidade.
         try:
-            info = _execute_download(
-                url=clean_url,
-                template=template,
-                max_bytes=max_bytes,
-                max_mb=max_mb,
-                cookiefile=None,
-                progress_callback=progress_callback,
+            info = _executar_download(
+                url_limpa, template, limite_bytes, limite_mb, cookiefile=None
             )
-        except yt_dlp.utils.DownloadError as first_error:
-            message = str(first_error)
-            if "limite" in message.lower() or "too large" in message.lower():
+        except yt_dlp.utils.DownloadError as primeiro_erro:
+            mensagem = str(primeiro_erro)
+            if "limite" in mensagem.lower() or "too large" in mensagem.lower():
                 raise InstagramImportError(
-                    f"O vídeo ultrapassa o limite de {max_mb} MB."
-                ) from first_error
+                    f"O vídeo ultrapassa o limite de {limite_mb} MB."
+                ) from primeiro_erro
 
-            if not _looks_like_auth_error(message):
+            if not _erro_pede_autenticacao(mensagem):
                 raise InstagramImportError(
-                    "Não foi possível importar esse Reels. Confirme se o link é público e tente novamente."
-                ) from first_error
+                    "Não foi possível importar esse Reels. Confirme o link e tente novamente."
+                ) from primeiro_erro
 
-            # IPs de datacenter podem ser bloqueados mesmo em Reels públicos.
-            cookiefile = _create_cookie_file()
+            # IPs de nuvem podem receber resposta vazia mesmo para posts públicos.
+            cookiefile = _criar_arquivo_cookies_temporario()
             if not cookiefile:
                 raise InstagramImportError(
-                    "O Instagram bloqueou o download pelo servidor. Configure "
-                    "INSTAGRAM_COOKIES_B64 no Railway e tente novamente."
-                ) from first_error
+                    "O Instagram bloqueou a importação pelo servidor do Railway. "
+                    "Configure a variável INSTAGRAM_COOKIES_B64 e tente novamente."
+                ) from primeiro_erro
 
             try:
-                info = _execute_download(
-                    url=clean_url,
-                    template=template,
-                    max_bytes=max_bytes,
-                    max_mb=max_mb,
-                    cookiefile=cookiefile,
-                    progress_callback=progress_callback,
+                info = _executar_download(
+                    url_limpa, template, limite_bytes, limite_mb, cookiefile=cookiefile
                 )
-            except yt_dlp.utils.DownloadError as second_error:
-                second_message = str(second_error)
-                if "limite" in second_message.lower() or "too large" in second_message.lower():
+            except yt_dlp.utils.DownloadError as segundo_erro:
+                mensagem2 = str(segundo_erro)
+                if "limite" in mensagem2.lower() or "too large" in mensagem2.lower():
                     raise InstagramImportError(
-                        f"O vídeo ultrapassa o limite de {max_mb} MB."
-                    ) from second_error
-                if _looks_like_auth_error(second_message):
+                        f"O vídeo ultrapassa o limite de {limite_mb} MB."
+                    ) from segundo_erro
+                if _erro_pede_autenticacao(mensagem2):
                     raise InstagramImportError(
                         "Os cookies do Instagram expiraram ou foram recusados. "
                         "Exporte um cookies.txt novo e atualize INSTAGRAM_COOKIES_B64 no Railway."
-                    ) from second_error
+                    ) from segundo_erro
                 raise InstagramImportError(
-                    "O Instagram recusou o download mesmo com autenticação. Tente novamente mais tarde."
-                ) from second_error
+                    "O Instagram recusou esse download mesmo com autenticação. Tente novamente mais tarde."
+                ) from segundo_erro
+
+        titulo = ((info or {}).get("title") or (info or {}).get("id") or "reel_instagram").strip()
+
     finally:
         if cookiefile:
             try:
@@ -274,38 +248,32 @@ def download_instagram_video(
             except OSError:
                 pass
 
-    candidates = sorted(folder.glob(f"{identifier}_instagram.*"))
-    downloaded = next((item for item in candidates if item.suffix.lower() == ".mp4"), None)
-    if downloaded is None:
-        downloaded = next(
+    candidatos = sorted(pasta.glob(f"{identificador}_instagram.*"))
+    arquivo = next((p for p in candidatos if p.suffix.lower() == ".mp4"), None)
+    if arquivo is None:
+        arquivo = next(
             (
-                item
-                for item in candidates
-                if item.is_file() and item.suffix.lower() not in {".part", ".ytdl"}
+                p
+                for p in candidatos
+                if p.is_file() and p.suffix.lower() not in {".part", ".ytdl"}
             ),
             None,
         )
 
-    if downloaded is None or not downloaded.exists():
+    if arquivo is None or not arquivo.exists():
         raise InstagramImportError(
             "O download terminou, mas o arquivo de vídeo não foi encontrado."
         )
 
-    if downloaded.stat().st_size > max_bytes:
+    if arquivo.stat().st_size > limite_bytes:
         try:
-            downloaded.unlink()
+            arquivo.unlink()
         except OSError:
             pass
-        raise InstagramImportError(f"O vídeo ultrapassa o limite de {max_mb} MB.")
+        raise InstagramImportError(
+            f"O vídeo ultrapassa o limite de {limite_mb} MB."
+        )
 
-    title = ((info or {}).get("title") or (info or {}).get("id") or "reel_instagram").strip()
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("._")[:70]
-    safe_name = safe_name or "reel_instagram"
-    final_path = folder / f"{safe_name}{downloaded.suffix.lower()}"
-    if final_path != downloaded:
-        if final_path.exists():
-            final_path = folder / f"{safe_name}_{identifier[:8]}{downloaded.suffix.lower()}"
-        downloaded.replace(final_path)
-        downloaded = final_path
-
-    return str(downloaded), downloaded.name
+    nome = re.sub(r"[^A-Za-z0-9._-]+", "_", titulo).strip("._")[:80]
+    nome = nome or "reel_instagram"
+    return str(arquivo), f"{nome}.mp4"
