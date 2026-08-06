@@ -1,32 +1,37 @@
 # Mídia + Vídeo Automático
 
-Mini SaaS em Python para criar vídeos a partir de:
+Mini SaaS em Python que substitui o primeiro take de um vídeo por uma foto ou outro vídeo, recria a legenda e mantém o áudio e a continuação do original.
 
-- uma **foto ou vídeo** novo para o primeiro take;
-- um vídeo original contendo áudio e, opcionalmente, uma continuação;
-- legenda automática ou texto fixo com suporte a **emojis**.
+Nesta versão, o vídeo original pode ser fornecido de duas formas:
 
-O sistema detecta onde o primeiro take termina, substitui esse trecho pela nova mídia e mantém o áudio do vídeo original do começo ao fim.
+- anexando o arquivo normalmente;
+- colando o link de um Reels público do Instagram, sem precisar baixá-lo antes.
 
-## Novidades desta versão
-
-- O primeiro upload aceita imagem e vídeo.
-- O tipo da mídia é reconhecido automaticamente.
-- Vídeo inicial curto é repetido até a troca do take.
-- Vídeo inicial longo é cortado exatamente na troca.
-- O detector procura cortes mesmo quando o primeiro take original possui movimento.
-- Textos manuais aceitam Unicode e emojis, com fontes Noto instaladas no Docker.
-
-## Como funciona
+## Como usar
 
 1. Envie a nova mídia da personagem: foto ou vídeo.
-2. Envie o vídeo original com o áudio.
-3. O sistema detecta a primeira troca de take ou usa o segundo informado manualmente.
-4. O trecho inicial é criado com a nova mídia.
-5. A legenda é transcrita do áudio ou digitada manualmente.
-6. A continuação original volta no ponto detectado.
-7. O áudio do vídeo original é mantido.
-8. A saída segue a proporção da primeira mídia.
+2. No campo **Vídeo original com áudio e possível continuação**, escolha uma opção:
+   - anexe o vídeo; ou
+   - cole o link do Reels e clique em **IMPORTAR VÍDEO PELO LINK**.
+3. Se desejar, clique em **Analisar troca do take**.
+4. Escolha a forma de detectar a transição e configurar a legenda.
+5. Clique em **GERAR VÍDEO**.
+
+Depois da importação pelo link, o vídeo baixado aparece automaticamente no campo 2 e pode ser processado exatamente como um arquivo anexado.
+
+## Recursos
+
+- primeiro take com foto ou vídeo;
+- repetição automática quando o vídeo inicial é curto;
+- corte automático quando o vídeo inicial é longo;
+- detecção automática ou manual da troca de take;
+- manutenção do áudio original;
+- continuação com fundo desfocado, barras pretas ou preenchimento da tela;
+- transcrição com Whisper;
+- leitura de texto gravado no vídeo por OCR;
+- texto manual com Unicode e emojis;
+- importação de Reels usando `yt-dlp`;
+- nova tentativa com cookies quando o Instagram bloqueia o IP do Railway.
 
 ## Estrutura
 
@@ -37,6 +42,7 @@ O sistema detecta onde o primeiro take termina, substitui esse trecho pela nova 
 │   ├── __init__.py
 │   ├── captions.py
 │   ├── config.py
+│   ├── instagram_import.py
 │   ├── media.py
 │   ├── processor.py
 │   └── transition.py
@@ -48,47 +54,69 @@ O sistema detecta onde o primeiro take termina, substitui esse trecho pela nova 
 └── run_local.sh
 ```
 
-> Importante: a pasta deve se chamar exatamente `core` e conter o arquivo `__init__.py`.
+> A pasta deve se chamar exatamente `core` e conter o arquivo `__init__.py`.
 
 ## Railway
 
-Suba todos os arquivos para a raiz do repositório, mantendo a pasta `core`. O Railway usará o `Dockerfile` e a porta fornecida pela variável `PORT`.
+Suba todos os arquivos para a raiz do repositório, mantendo a pasta `core`. O Railway utilizará o `Dockerfile` e a porta definida em `PORT`.
 
-Após o push no GitHub, o Railway fará um novo deploy automaticamente. O healthcheck é:
+O healthcheck é:
 
 ```text
 GET /health
 ```
 
-## Emojis
+Após atualizar os arquivos no GitHub, o Railway fará o novo deploy automaticamente.
 
-O Docker instala:
+## Importação do Instagram e cookies
 
-- DejaVu Sans;
-- Noto Sans/Symbols;
-- Noto Color Emoji.
+O sistema tenta baixar o Reels sem autenticação primeiro. Em alguns casos, o Instagram bloqueia IPs de datacenter mesmo quando a publicação é pública. Quando isso acontecer, o aplicativo pedirá a configuração de cookies.
 
-As legendas são renderizadas como camadas PNG em Unicode. Isso evita os quadrados que o libass pode mostrar com alguns emojis e permite emojis coloridos quando a fonte do sistema oferece essa versão. Exemplos válidos:
+Variáveis aceitas:
 
-```text
-Quase de graça 😱🔥
-Corre antes que acabe 🛍️✨
+```env
+MAX_INSTAGRAM_DOWNLOAD_MB=500
+INSTAGRAM_COOKIES_B64=
+INSTAGRAM_COOKIES=
+INSTAGRAM_FORCE_IPV4=0
 ```
 
-No Windows local, o FFmpeg também pode usar as fontes de emoji instaladas no sistema. Caso algum emoji muito novo apareça como quadrado, atualize o FFmpeg/fontes ou rode pelo Docker/Railway.
+A opção recomendada é `INSTAGRAM_COOKIES_B64`:
 
-## Variáveis úteis
+1. Entre no Instagram pelo navegador.
+2. Exporte os cookies do domínio `instagram.com` no formato Netscape `cookies.txt`.
+3. Converta o arquivo para Base64.
+4. No Railway, abra **Variables** e crie `INSTAGRAM_COOKIES_B64` com o conteúdo gerado.
+5. Faça um novo deploy ou reinicie o serviço.
+
+Linux/macOS:
+
+```bash
+base64 -i cookies.txt | tr -d '\n'
+```
+
+PowerShell:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))
+```
+
+Os cookies ficam somente no servidor. O aplicativo cria um arquivo temporário durante a tentativa de download e o apaga em seguida.
+
+## Variáveis principais
 
 ```env
 WHISPER_MODEL=tiny
 MAX_VIDEO_MINUTES=10
 MAX_UPLOAD_SIZE=500mb
+MAX_INSTAGRAM_DOWNLOAD_MB=500
 OUTPUT_CRF=20
 OUTPUT_PRESET=veryfast
 OUTPUT_MAX_LONG_EDGE=1920
 FFMPEG_THREADS=1
 BACKGROUND_BLUR_DIVISOR=4
 TRANSITION_MAX_SCAN_SECONDS=90
+TEMP_MAX_AGE_HOURS=3
 ```
 
-`TRANSITION_MAX_SCAN_SECONDS` define até quantos segundos o detector procura a primeira troca. Para vídeos comuns de Reels/TikTok, 90 segundos é mais que suficiente.
+`TRANSITION_MAX_SCAN_SECONDS` define por quanto tempo o detector procura a primeira troca. `TEMP_MAX_AGE_HOURS` controla quando os downloads e resultados temporários antigos são apagados.

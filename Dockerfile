@@ -8,6 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WORK_ROOT=/tmp/foto_video_saas
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     ffmpeg \
     fontconfig \
     fonts-dejavu-core \

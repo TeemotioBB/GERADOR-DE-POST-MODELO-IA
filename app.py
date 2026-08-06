@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import uuid
 from pathlib import Path
 
 import gradio as gr
@@ -8,7 +10,8 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from core.config import APP_NAME, WORK_ROOT
+from core.config import APP_NAME, MAX_INSTAGRAM_DOWNLOAD_MB, MAX_VIDEO_MINUTES, WORK_ROOT
+from core.instagram_import import InstagramImportError, download_instagram_video
 from core.media import MediaError, probe_video
 from core.processor import cleanup_old_jobs, process_video
 from core.transition import detect_intro_end
@@ -21,6 +24,8 @@ CSS = """
 .hero h1 {margin-bottom: 6px !important;}
 .small-note {font-size: 0.92rem; opacity: 0.82;}
 #generate-btn {min-height: 48px; font-weight: 700;}
+#import-instagram-btn {min-height: 44px; font-weight: 700;}
+.import-box {padding: 14px; border: 1px solid var(--border-color-primary); border-radius: 14px;}
 """
 
 
@@ -30,6 +35,57 @@ def transition_visibility(choice: str):
 
 def caption_visibility(choice: str):
     return gr.update(visible=choice == "Usar um texto fixo")
+
+
+
+def import_instagram_video(url: str, progress=gr.Progress()):
+    clean_url = (url or "").strip()
+    if not clean_url:
+        raise gr.Error("Cole o link do Reels do Instagram.")
+
+    cleanup_old_jobs()
+    import_id = uuid.uuid4().hex
+    import_dir = Path(WORK_ROOT) / f"instagram_{import_id}"
+    import_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        progress(0.02, desc="Preparando a importação...")
+        video_path, display_name = download_instagram_video(
+            clean_url,
+            import_dir,
+            import_id,
+            max_mb=MAX_INSTAGRAM_DOWNLOAD_MB,
+            progress_callback=lambda value, description: progress(
+                0.05 + 0.72 * max(0.0, min(1.0, value)),
+                desc=description,
+            ),
+        )
+
+        progress(0.82, desc="Conferindo vídeo e áudio...")
+        info = probe_video(video_path)
+        if info.duration <= 0:
+            raise MediaError("A duração do vídeo importado é inválida.")
+        if info.duration > MAX_VIDEO_MINUTES * 60:
+            raise MediaError(
+                f"O vídeo importado tem {info.duration / 60:.1f} minutos. "
+                f"O limite configurado é {MAX_VIDEO_MINUTES:.0f} minutos."
+            )
+
+        progress(1.0, desc="Reels importado e pronto para editar.")
+        status = (
+            "✅ **Reels importado com sucesso.**  \n"
+            f"Arquivo: `{display_name}`  \n"
+            f"Duração: {info.duration:.2f}s · {info.width}×{info.height} · "
+            f"Áudio: {'sim' if info.has_audio else 'não'}  \n"
+            "O vídeo já foi colocado no campo 2. Agora você pode analisar ou gerar diretamente."
+        )
+        return video_path, status, ""
+    except (InstagramImportError, MediaError) as exc:
+        shutil.rmtree(import_dir, ignore_errors=True)
+        raise gr.Error(str(exc)) from exc
+    except Exception as exc:
+        shutil.rmtree(import_dir, ignore_errors=True)
+        raise gr.Error(f"Falha inesperada ao importar o Reels: {exc}") from exc
 
 
 def analyze_video(video_path: str | None):
@@ -132,6 +188,22 @@ with gr.Blocks(title=APP_NAME) as demo:
                 file_types=["video"],
                 type="filepath",
             )
+            with gr.Group(elem_classes=["import-box"]):
+                gr.Markdown(
+                    "**Ou importe o vídeo direto pelo link do Instagram**",
+                    elem_classes=["small-note"],
+                )
+                instagram_url = gr.Textbox(
+                    label="Link do Reels",
+                    placeholder="https://www.instagram.com/reel/XXXXXXXXXXX/",
+                    lines=1,
+                )
+                import_instagram_button = gr.Button(
+                    "IMPORTAR VÍDEO PELO LINK",
+                    variant="secondary",
+                    elem_id="import-instagram-btn",
+                )
+                import_status = gr.Markdown()
             gr.Markdown(
                 "A proporção final segue a primeira mídia. Se ela for um vídeo curto, ele será repetido até a troca do take; se for longo, será cortado no ponto da troca.",
                 elem_classes=["small-note"],
@@ -227,6 +299,12 @@ with gr.Blocks(title=APP_NAME) as demo:
         inputs=caption_mode,
         outputs=manual_caption,
     )
+    import_instagram_button.click(
+        fn=import_instagram_video,
+        inputs=instagram_url,
+        outputs=[video, import_status, instagram_url],
+        api_name="import_instagram",
+    )
     analyze_button.click(
         fn=analyze_video,
         inputs=video,
@@ -269,6 +347,7 @@ def api_info():
         "status": "online",
         "intro_media": ["image", "video"],
         "emoji_captions": True,
+        "instagram_import": True,
     }
 
 
