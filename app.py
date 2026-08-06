@@ -309,18 +309,21 @@ with gr.Blocks(title=APP_NAME) as demo:
     )
     
     # Análise do vídeo
-    def analyze_wrapper():
-        video_path = video_path_state.value
+    # O valor de gr.State precisa entrar como input do callback.
+    def analyze_wrapper(video_path):
         return analyze_video(video_path)
     
     analyze_button.click(
         fn=analyze_wrapper,
+        inputs=video_path_state,
         outputs=[analysis_result, manual_transition],
     )
     
     # Geração
+    # O caminho do upload/URL é recebido diretamente do gr.State.
     def generate_wrapper(
         intro_media_path,
+        video_path,
         transition_mode,
         manual_transition_seconds,
         caption_mode,
@@ -331,7 +334,6 @@ with gr.Blocks(title=APP_NAME) as demo:
         language_label,
         progress=gr.Progress(),
     ):
-        video_path = video_path_state.value
         return generate_video(
             intro_media_path,
             video_path,
@@ -350,6 +352,7 @@ with gr.Blocks(title=APP_NAME) as demo:
         fn=generate_wrapper,
         inputs=[
             intro_media,
+            video_path_state,
             transition_mode,
             manual_transition,
             caption_mode,
