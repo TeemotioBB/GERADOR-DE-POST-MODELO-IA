@@ -70,7 +70,9 @@ Após atualizar os arquivos no GitHub, o Railway fará o novo deploy automaticam
 
 ## Importação do Instagram e cookies
 
-O sistema tenta baixar o Reels sem autenticação primeiro. Em alguns casos, o Instagram bloqueia IPs de datacenter mesmo quando a publicação é pública. Quando isso acontecer, o aplicativo pedirá a configuração de cookies.
+O sistema usa exatamente o mesmo módulo `instagram_import.py` do Gerador de Memes: tenta baixar o Reels sem autenticação primeiro e, quando o Instagram bloqueia o IP do Railway, tenta novamente com os cookies configurados no próprio serviço.
+
+> **Importante:** as variáveis do Railway não são compartilhadas entre projetos ou serviços. Mesmo que `INSTAGRAM_COOKIES_B64` já exista no Gerador de Memes, você precisa copiar a mesma variável para este novo serviço.
 
 Variáveis aceitas:
 

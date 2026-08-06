@@ -10,4 +10,4 @@ python-multipart>=0.0.20,<1
 regex>=2025.0,<2027
 pytesseract>=0.3,<1
 
-yt-dlp>=2025.1,<2027
+yt-dlp

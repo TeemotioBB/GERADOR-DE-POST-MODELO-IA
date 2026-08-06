@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from core.config import APP_NAME, MAX_INSTAGRAM_DOWNLOAD_MB, MAX_VIDEO_MINUTES, WORK_ROOT
-from core.instagram_import import InstagramImportError, download_instagram_video
+from core.instagram_import import InstagramImportError, baixar_video_instagram
 from core.media import MediaError, probe_video
 from core.processor import cleanup_old_jobs, process_video
 from core.transition import detect_intro_end
@@ -50,15 +50,12 @@ def import_instagram_video(url: str, progress=gr.Progress()):
 
     try:
         progress(0.02, desc="Preparando a importação...")
-        video_path, display_name = download_instagram_video(
-            clean_url,
-            import_dir,
-            import_id,
-            max_mb=MAX_INSTAGRAM_DOWNLOAD_MB,
-            progress_callback=lambda value, description: progress(
-                0.05 + 0.72 * max(0.0, min(1.0, value)),
-                desc=description,
-            ),
+        progress(0.08, desc="Baixando o Reels do Instagram...")
+        video_path, display_name = baixar_video_instagram(
+            url=clean_url,
+            pasta_destino=str(import_dir),
+            identificador=import_id,
+            limite_mb=MAX_INSTAGRAM_DOWNLOAD_MB,
         )
 
         progress(0.82, desc="Conferindo vídeo e áudio...")
