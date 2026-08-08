@@ -343,22 +343,31 @@ def process_video(
         if not caption_events:
             transcript_summary = "O Whisper não encontrou fala clara no primeiro trecho."
     elif caption_mode == "Copiar o texto escrito no vídeo original":
-        _safe_progress(progress, 0.30, "Lendo a legenda escrita no primeiro take...")
-        ocr_text, ocr_confidence = read_burned_caption(
-            video_path,
-            intro_duration,
-            language=language or "pt",
-        )
-        if not ocr_text:
-            raise MediaError(
-                "Não foi possível ler nenhuma legenda escrita no primeiro take. "
-                "Use 'Usar um texto fixo' e digite a legenda manualmente."
+        reviewed_text = (manual_caption_text or "").strip()
+        if reviewed_text:
+            caption_events = manual_caption(reviewed_text, intro_duration)
+            transcript_summary = (
+                "Legenda revisada antes da geração (texto e emojis preservados):\n"
+                f"{reviewed_text}"
             )
-        caption_events = manual_caption(ocr_text, intro_duration)
-        transcript_summary = (
-            f"Legenda lida do vídeo original (confiança {ocr_confidence:.0f}%):\n{ocr_text}\n"
-            "Emojis não são reconhecidos pelo OCR; se a original tiver emoji, use o texto fixo."
-        )
+        else:
+            _safe_progress(progress, 0.30, "Lendo a legenda escrita no primeiro take...")
+            ocr_text, ocr_confidence = read_burned_caption(
+                video_path,
+                intro_duration,
+                language=language or "pt",
+            )
+            if not ocr_text:
+                raise MediaError(
+                    "Não foi possível ler nenhuma legenda escrita no primeiro take. "
+                    "Clique em 'LER TEXTO DO VÍDEO', revise o texto e tente novamente."
+                )
+            caption_events = manual_caption(ocr_text, intro_duration)
+            transcript_summary = (
+                f"Legenda lida automaticamente (confiança {ocr_confidence:.0f}%):\n{ocr_text}\n"
+                "Observação: OCR tradicional não reconhece emojis de forma confiável. "
+                "Use o campo de revisão para adicionar/corrigir emojis quando necessário."
+            )
     elif caption_mode == "Usar um texto fixo":
         caption_events = manual_caption(manual_caption_text, intro_duration)
         if not caption_events:
@@ -447,6 +456,8 @@ def process_video(
             str(OUTPUT_CRF),
             "-pix_fmt",
             "yuv420p",
+            "-tag:v",
+            "avc1",
             "-threads",
             str(FFMPEG_THREADS),
             "-movflags",
@@ -454,7 +465,7 @@ def process_video(
         ]
     )
     if audio_label:
-        command.extend(["-c:a", "aac", "-b:a", OUTPUT_AUDIO_BITRATE])
+        command.extend(["-c:a", "aac", "-b:a", OUTPUT_AUDIO_BITRATE, "-ar", "48000"])
     else:
         command.append("-an")
     command.extend(["-max_muxing_queue_size", "2048", str(output_path)])
