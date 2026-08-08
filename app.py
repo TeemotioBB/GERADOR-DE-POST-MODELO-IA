@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import os
+import re
 import uuid
 import json
 from pathlib import Path
 
 import gradio as gr
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 
 from core.config import APP_NAME, WORK_ROOT
-from core.captions import read_burned_caption
 from core.media import MediaError, probe_video
 from core.processor import cleanup_old_jobs, process_video
 from core.transition import detect_intro_end
@@ -29,7 +29,33 @@ CSS = """
 
 # Cache de vídeos importados por URL (para evitar re-análise)
 IMPORTED_VIDEOS = {}
-GENERATED_VIDEOS = {}
+
+# Nome de pasta de job é sempre um uuid4().hex (32 chars hexadecimais) — ver
+# `job_dir = WORK_ROOT / uuid.uuid4().hex` em core/processor.py.
+_JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _job_video_link_html(output_path: str) -> str:
+    """Monta um link direto para o vídeo pronto (fora do player do Gradio).
+
+    No iPhone, o botão de download do próprio Gradio costuma salvar em
+    Arquivos, não na Galeria/Fotos — e em alguns iOS o preview embutido do
+    Gradio simplesmente não carrega. Abrindo o vídeo direto numa aba do
+    Safari, o player nativo assume e o menu Compartilhar ganha a opção
+    "Salvar Vídeo", que salva direto na Galeria.
+    """
+    job_id = Path(output_path).parent.name
+    if not _JOB_ID_RE.match(job_id):
+        return ""
+    return (
+        "<div class='small-note' style='margin-top:8px; line-height:1.5;'>"
+        f"<a href='/midia/{job_id}.mp4' target='_blank' rel='noopener'>"
+        "🔗 Abrir vídeo em uma aba (recomendado no celular)</a><br>"
+        "<b>No iPhone:</b> toque no link acima, espere o vídeo abrir em tela cheia, toque no ícone de "
+        "Compartilhar (o quadrado com a seta) e escolha <b>“Salvar Vídeo”</b> — assim ele vai direto "
+        "para a Galeria/Fotos."
+        "</div>"
+    )
 
 
 def transition_visibility(choice: str):
@@ -37,20 +63,7 @@ def transition_visibility(choice: str):
 
 
 def caption_visibility(choice: str):
-    is_copy = choice == "Copiar o texto escrito no vídeo original"
-    is_manual = choice == "Usar um texto fixo"
-    visible = is_copy or is_manual
-    if is_copy:
-        label = "Texto detectado — revise antes de gerar (emojis podem ser adicionados aqui)"
-        placeholder = "Clique em LER TEXTO DO VÍDEO, confira a frase e corrija/adicione emojis se necessário."
-    else:
-        label = "Texto da legenda (emojis permitidos 😍🔥✨)"
-        placeholder = "Digite a frase com texto e emojis..."
-    return (
-        gr.update(visible=visible, label=label, placeholder=placeholder),
-        gr.update(visible=is_copy),
-        gr.update(visible=is_copy),
-    )
+    return gr.update(visible=choice == "Usar um texto fixo")
 
 
 def video_input_visibility(choice: str):
@@ -116,56 +129,6 @@ def importar_video_url(url: str):
         raise gr.Error(f"Falha ao importar: {e}") from e
 
 
-def read_caption_for_review(
-    video_path: str | None,
-    transition_mode: str,
-    manual_transition_seconds: float | None,
-    language_label: str,
-):
-    if not video_path:
-        raise gr.Error("Envie ou importe o vídeo original primeiro.")
-
-    language_map = {
-        "Português": "pt",
-        "Detectar automaticamente": "",
-        "Inglês": "en",
-        "Espanhol": "es",
-    }
-
-    try:
-        info = probe_video(video_path)
-        if transition_mode == "Sem vídeo de continuação":
-            intro_duration = info.duration
-        elif transition_mode == "Informar o segundo manualmente":
-            if manual_transition_seconds is None:
-                raise MediaError("Informe o segundo da transição antes de ler o texto.")
-            intro_duration = float(manual_transition_seconds)
-            if intro_duration <= 0 or intro_duration > info.duration:
-                raise MediaError(f"A transição precisa ficar entre 0 e {info.duration:.2f}s.")
-        else:
-            detected = detect_intro_end(video_path)
-            intro_duration = detected.seconds if detected.seconds is not None else info.duration
-
-        text, confidence = read_burned_caption(
-            video_path,
-            intro_duration,
-            language=language_map.get(language_label, "pt"),
-        )
-    except MediaError as exc:
-        raise gr.Error(str(exc)) from exc
-
-    if not text:
-        raise gr.Error(
-            "Não consegui identificar um texto confiável. Você ainda pode digitá-lo manualmente no campo de revisão."
-        )
-
-    status = (
-        f"✅ Texto detectado com confiança aproximada de **{confidence:.0f}%**. "
-        "Confira antes de gerar. Emojis do vídeo precisam ser adicionados nesse campo, pois OCR tradicional não os reconhece com segurança."
-    )
-    return text, gr.update(value=status, visible=True)
-
-
 def generate_video(
     intro_media_path: str | None,
     video_path: str | None,
@@ -205,7 +168,12 @@ def generate_video(
     except Exception as exc:
         raise gr.Error(f"Erro inesperado: {exc}") from exc
 
-    return result.output_path, result.report, result.transition_seconds
+    return (
+        result.output_path,
+        result.report,
+        result.transition_seconds,
+        _job_video_link_html(result.output_path),
+    )
 
 
 with gr.Blocks(title=APP_NAME) as demo:
@@ -311,11 +279,9 @@ with gr.Blocks(title=APP_NAME) as demo:
             manual_caption = gr.Textbox(
                 label="Texto da legenda (emojis permitidos 😍🔥✨)",
                 placeholder="Digite a frase com texto e emojis...",
-                lines=4,
+                lines=3,
                 visible=False,
             )
-            read_caption_button = gr.Button("🔎 LER TEXTO DO VÍDEO", variant="secondary", visible=False)
-            ocr_status = gr.Markdown(visible=False)
 
             with gr.Row():
                 caption_position = gr.Dropdown(
@@ -340,23 +306,11 @@ with gr.Blocks(title=APP_NAME) as demo:
     generate_button = gr.Button("GERAR VÍDEO", variant="primary", elem_id="generate-btn")
 
     with gr.Row(equal_height=False):
-        output_video = gr.Video(
-            label="Prévia do vídeo pronto",
-            format="mp4",
-            autoplay=False,
-            buttons=["download"],
-            height=640,
-        )
+        output_video = gr.Video(label="Vídeo pronto")
         with gr.Column():
-            download_file = gr.DownloadButton("⬇️ BAIXAR MP4", value=None, variant="primary")
-            iphone_action = gr.HTML()
-            gr.Markdown(
-                "No iPhone, o download comum do Safari costuma ir para **Arquivos**. "
-                "Use **Abrir vídeo no iPhone** e depois Compartilhar → **Salvar Vídeo** para mandar à galeria.",
-                elem_classes=["small-note"],
-            )
             report = gr.Markdown()
             transition_used = gr.Number(label="Segundo da transição usado", interactive=False)
+            save_link = gr.HTML()
 
     # === LÓGICA DE EVENTOS ===
     
@@ -398,13 +352,6 @@ with gr.Blocks(title=APP_NAME) as demo:
         outputs=[analysis_result, manual_transition],
     )
 
-    # Pré-leitura da legenda escrita, para o usuário corrigir antes de renderizar.
-    read_caption_button.click(
-        fn=read_caption_for_review,
-        inputs=[video_path_state, transition_mode, manual_transition, language],
-        outputs=[manual_caption, ocr_status],
-    )
-
     # Geração
     def generate_wrapper(
         intro_media_path,
@@ -419,7 +366,7 @@ with gr.Blocks(title=APP_NAME) as demo:
         language_label,
         progress=gr.Progress(),
     ):
-        output_path, result_report, transition_seconds = generate_video(
+        return generate_video(
             intro_media_path,
             video_path,
             transition_mode,
@@ -432,15 +379,6 @@ with gr.Blocks(title=APP_NAME) as demo:
             language_label,
             progress,
         )
-        token = uuid.uuid4().hex
-        GENERATED_VIDEOS[token] = output_path
-        iphone_html = (
-            f'<a href="/iphone-video/{token}" target="_blank" '
-            'style="display:block;text-align:center;padding:13px 16px;border-radius:10px;'
-            'font-weight:700;text-decoration:none;border:1px solid currentColor;margin-top:10px;">'
-            '🍎 ABRIR VÍDEO NO IPHONE / SALVAR EM FOTOS</a>'
-        )
-        return output_path, output_path, iphone_html, result_report, transition_seconds
 
     generate_button.click(
         fn=generate_wrapper,
@@ -456,7 +394,7 @@ with gr.Blocks(title=APP_NAME) as demo:
             continuation_fit,
             language,
         ],
-        outputs=[output_video, download_file, iphone_action, report, transition_used],
+        outputs=[output_video, report, transition_used, save_link],
         api_name="generate",
     )
 
@@ -469,7 +407,7 @@ with gr.Blocks(title=APP_NAME) as demo:
     caption_mode.change(
         fn=caption_visibility,
         inputs=caption_mode,
-        outputs=[manual_caption, read_caption_button, ocr_status],
+        outputs=manual_caption,
     )
 
 
@@ -483,24 +421,34 @@ def health():
     return JSONResponse({"status": "ok"})
 
 
-@fastapi_app.get("/iphone-video/{token}")
-def iphone_video(token: str):
-    path_value = GENERATED_VIDEOS.get(token)
-    if not path_value:
-        raise HTTPException(status_code=404, detail="Vídeo não encontrado ou expirado.")
+@fastapi_app.get("/midia/{job_id}.mp4")
+def get_job_video(job_id: str):
+    """Serve o vídeo pronto direto (fora do player do Gradio).
 
-    path = Path(path_value).resolve()
-    work_root = Path(WORK_ROOT).resolve()
-    if work_root not in path.parents or not path.exists() or not path.is_file():
-        GENERATED_VIDEOS.pop(token, None)
-        raise HTTPException(status_code=404, detail="Vídeo não encontrado ou expirado.")
+    Abrir essa URL diretamente no Safari faz o iOS tratar o conteúdo com o
+    player nativo (em vez de um download de arquivo genérico), habilitando
+    'Salvar Vídeo' no menu Compartilhar — que manda direto pra Galeria.
+    """
+    if not _JOB_ID_RE.match(job_id):
+        return JSONResponse({"erro": "identificador inválido"}, status_code=400)
+
+    path = (WORK_ROOT / job_id / "video_pronto.mp4").resolve()
+    try:
+        path.relative_to(Path(WORK_ROOT).resolve())
+    except ValueError:
+        return JSONResponse({"erro": "identificador inválido"}, status_code=400)
+
+    if not path.exists():
+        return JSONResponse(
+            {"erro": "Vídeo não encontrado. Ele pode ter expirado (limpeza automática) ou o link está errado."},
+            status_code=404,
+        )
 
     return FileResponse(
-        path=str(path),
+        path,
         media_type="video/mp4",
         filename="video_pronto.mp4",
         content_disposition_type="inline",
-        headers={"Cache-Control": "no-store"},
     )
 
 
