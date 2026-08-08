@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import re
+from difflib import SequenceMatcher
 import shutil
 import subprocess
 import threading
@@ -499,51 +500,170 @@ def _ocr_grab_frame(video_path: str | Path, time_sec: float):
         cap.release()
 
 
-def _ocr_variants(frame):
-    """Prepara duas versões do quadro: cinza puro e 'texto branco isolado'.
+def _ocr_regions(frame):
+    """Recorta áreas prováveis de legenda e evita bordas com logos/@/UI."""
+    height, width = frame.shape[:2]
+    x0 = int(width * 0.035)
+    x1 = int(width * 0.965)
+    regions = [
+        ("central", frame[int(height * 0.08):int(height * 0.92), x0:x1], 1.00),
+        ("superior", frame[int(height * 0.06):int(height * 0.55), x0:x1], 0.96),
+        ("meio", frame[int(height * 0.22):int(height * 0.78), x0:x1], 1.04),
+        ("inferior", frame[int(height * 0.45):int(height * 0.94), x0:x1], 0.96),
+    ]
+    return [(name, crop, weight) for name, crop, weight in regions if crop.size]
 
-    Legendas de reels costumam ser texto branco com contorno preto. Isolar os
-    pixels quase brancos remove o fundo e melhora muito o reconhecimento.
-    """
+
+def _ocr_variants(frame):
+    """Gera versões robustas para texto branco/escuro com contorno em Reels."""
     import cv2
     import numpy as np
 
     height, width = frame.shape[:2]
-    if width < 1000:
-        scale = 1000.0 / width
-        frame = cv2.resize(frame, (1000, int(round(height * scale))), interpolation=cv2.INTER_CUBIC)
+    target_width = 1280
+    if width < target_width:
+        scale = target_width / max(width, 1)
+        frame = cv2.resize(
+            frame,
+            (target_width, max(2, int(round(height * scale)))),
+            interpolation=cv2.INTER_CUBIC,
+        )
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    white = (gray >= 200).astype(np.uint8) * 255
-    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    isolated = 255 - white
-    return [gray, isolated]
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    white_mask = ((value >= 175) & (saturation <= 125)).astype(np.uint8) * 255
+    kernel = np.ones((3, 3), np.uint8)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel)
+    isolated_white = 255 - white_mask
+
+    adaptive = cv2.adaptiveThreshold(
+        clahe,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11,
+    )
+
+    return [
+        ("clahe", clahe),
+        ("branco", isolated_white),
+        ("adaptativo", adaptive),
+    ]
 
 
-def _ocr_frame(image, lang: str) -> tuple[str, float]:
+def _clean_ocr_text(text: str) -> str:
+    """Remove quebras artificiais e pequenos artefatos sem destruir pontuação."""
+    text = (text or "").replace("|", " ").replace("¦", " ")
+    text = re.sub(r"[\t\r\f\v]+", " ", text)
+    lines = []
+    for raw in text.splitlines():
+        line = re.sub(r"\s+", " ", raw).strip(" _-—~")
+        if not line:
+            continue
+        alnum = len(re.findall(r"[\wÀ-ÿ]", line, flags=re.UNICODE))
+        printable = len(re.sub(r"\s", "", line))
+        if printable and alnum / printable < 0.42:
+            continue
+        if re.fullmatch(r"(?:[._~\-—]+|\d{1,2})", line):
+            continue
+        lines.append(line)
+
+    # A posição/line wrap é refeita pelo renderizador; manter quebras do Tesseract
+    # costuma gerar linhas erradas. Junta tudo e corrige espaços de pontuação.
+    joined = " ".join(lines)
+    joined = re.sub(r"\s+([,.;:!?])", r"\1", joined)
+    joined = re.sub(r"([¿¡])\s+", r"\1", joined)
+    joined = re.sub(r"\s+", " ", joined).strip()
+    return joined
+
+
+def _ocr_frame(image, lang: str, *, psm: int = 6) -> tuple[str, float]:
     import pytesseract
     from pytesseract import Output
 
-    data = pytesseract.image_to_data(image, lang=lang, config="--psm 6", output_type=Output.DICT)
-    lines: dict[tuple[int, int, int], list[str]] = {}
+    config = f"--oem 1 --psm {int(psm)} -c preserve_interword_spaces=1"
+    data = pytesseract.image_to_data(image, lang=lang, config=config, output_type=Output.DICT)
+    words: list[str] = []
     confidences: list[float] = []
+
     for index in range(len(data["text"])):
         token = (data["text"][index] or "").strip()
         try:
             confidence = float(data["conf"][index])
         except (TypeError, ValueError):
             continue
-        if not token or confidence < 55:
+        if not token or confidence < 34:
             continue
-        if not re.search(r"[\wÀ-ÿ]", token):
+
+        # Mantém pontuação útil; rejeita ruído que não contém nenhum caractere legível.
+        if not re.search(r"[\wÀ-ÿ0-9.,;:!?%$€£@#'\"()\-+]", token, flags=re.UNICODE):
             continue
-        key = (data["block_num"][index], data["par_num"][index], data["line_num"][index])
-        lines.setdefault(key, []).append(token)
+        words.append(token)
         confidences.append(confidence)
 
-    text = "\n".join(" ".join(words) for _key, words in sorted(lines.items())).strip()
+    text = _clean_ocr_text(" ".join(words))
     average = sum(confidences) / len(confidences) if confidences else 0.0
     return text, average
+
+
+def _text_quality(text: str) -> float:
+    if not text:
+        return 0.0
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return 0.0
+    alnum = len(re.findall(r"[\wÀ-ÿ]", compact, flags=re.UNICODE))
+    ratio = alnum / len(compact)
+    length_score = min(len(text) / 55.0, 1.0)
+    weird_runs = len(re.findall(r"[^\wÀ-ÿ\s.,;:!?%$€£@#'\"()\-+]{2,}", text, flags=re.UNICODE))
+    return max(0.0, min(1.0, 0.62 * ratio + 0.38 * length_score - weird_runs * 0.08))
+
+
+def _select_ocr_result(results: list[dict]) -> tuple[str, float, float]:
+    """Escolhe por consenso fuzzy entre frames, não por igualdade exata."""
+    if not results:
+        return "", 0.0, 0.0
+
+    normalized = [re.sub(r"\s+", " ", item["text"].lower()).strip() for item in results]
+    unique_frames = sorted({item["frame"] for item in results})
+
+    best_index = 0
+    best_score = -1.0
+    best_consensus = 0.0
+
+    for i, item in enumerate(results):
+        per_frame: dict[int, float] = {}
+        for j, other in enumerate(results):
+            if i == j:
+                sim = 1.0
+            else:
+                sim = SequenceMatcher(None, normalized[i], normalized[j]).ratio()
+            frame_id = other["frame"]
+            per_frame[frame_id] = max(per_frame.get(frame_id, 0.0), sim)
+
+        consensus = sum(per_frame.get(frame_id, 0.0) for frame_id in unique_frames) / max(len(unique_frames), 1)
+        confidence = min(max(item["confidence"] / 100.0, 0.0), 1.0)
+        quality = _text_quality(item["text"])
+        region_weight = item.get("region_weight", 1.0)
+        score = (0.47 * consensus + 0.30 * confidence + 0.23 * quality) * region_weight
+
+        if score > best_score:
+            best_index = i
+            best_score = score
+            best_consensus = consensus
+
+    best = results[best_index]
+    # Confiança apresentada é composta: OCR + repetição temporal + qualidade textual.
+    presented_confidence = 100.0 * min(
+        0.45 * (best["confidence"] / 100.0) + 0.40 * best_consensus + 0.15 * _text_quality(best["text"]),
+        1.0,
+    )
+    return best["text"], presented_confidence, best_consensus
 
 
 def read_burned_caption(
@@ -552,11 +672,14 @@ def read_burned_caption(
     *,
     language: str = "",
 ) -> tuple[str, float]:
-    """Lê o texto escrito (queimado) nos quadros do primeiro take.
+    """Lê texto queimado com poucos frames e consenso fuzzy.
 
-    Amostra 5 quadros espalhados pelo take, roda OCR em duas versões de cada um
-    e escolhe por votação o texto mais consistente. Retorna (texto, confiança%).
-    Emojis não são reconhecidos por OCR e ficam de fora do texto lido.
+    Mantém o custo de CPU controlado no Railway: a primeira passada usa apenas
+    6 chamadas de OCR (3 frames × 2 variantes). Uma segunda passada curta só
+    acontece quando a primeira leitura fica fraca.
+
+    OCR tradicional não identifica emojis de forma confiável; por isso o app
+    carrega o texto detectado em um campo editável antes da geração.
     """
     try:
         import pytesseract
@@ -570,40 +693,50 @@ def read_burned_caption(
         available = set(pytesseract.get_languages(config=""))
     except Exception as exc:
         raise MediaError(
-            "O programa Tesseract OCR não foi encontrado. No Docker/Railway ele é instalado "
-            "automaticamente; no Windows instale em https://github.com/UB-Mannheim/tesseract/wiki."
+            "O programa Tesseract OCR não foi encontrado. No Docker/Railway ele é instalado automaticamente."
         ) from exc
 
     preferred = _OCR_LANGUAGE_MAP.get((language or "").strip().lower())
     langs = [code for code in [preferred, "por", "eng"] if code and code in available]
     lang = "+".join(dict.fromkeys(langs)) or "eng"
 
-    results: list[tuple[str, float]] = []
-    for fraction in (0.15, 0.30, 0.50, 0.70, 0.85):
+    duration = max(float(duration), 0.05)
+    frames = []
+    for frame_index, fraction in enumerate((0.24, 0.50, 0.76)):
         frame = _ocr_grab_frame(video_path, duration * fraction)
-        if frame is None:
-            continue
-        for variant in _ocr_variants(frame):
-            try:
-                text, confidence = _ocr_frame(variant, lang)
-            except Exception as exc:
-                raise MediaError(f"Falha ao ler a legenda do vídeo: {exc}") from exc
-            if text:
-                results.append((text, confidence))
+        if frame is not None:
+            frames.append((frame_index, frame))
 
-    if not results:
-        return "", 0.0
+    results: list[dict] = []
 
-    def _normalized(value: str) -> str:
-        return re.sub(r"\s+", " ", value.lower()).strip()
+    def run_pass(*, fallback: bool = False) -> None:
+        for frame_index, frame in frames:
+            central = _ocr_regions(frame)[0][1]
+            variants = _ocr_variants(central)
+            chosen = variants[1:] if fallback else variants[:2]
+            psm = 11 if fallback else 6
+            for _variant_name, variant in chosen:
+                try:
+                    text, confidence = _ocr_frame(variant, lang, psm=psm)
+                except Exception as exc:
+                    raise MediaError(f"Falha ao ler a legenda do vídeo: {exc}") from exc
+                if len(re.findall(r"[\wÀ-ÿ]", text, flags=re.UNICODE)) < 3:
+                    continue
+                results.append(
+                    {
+                        "text": text,
+                        "confidence": confidence,
+                        "frame": frame_index,
+                        "region_weight": 1.0,
+                    }
+                )
 
-    counts: dict[str, int] = {}
-    for text, _confidence in results:
-        key = _normalized(text)
-        counts[key] = counts.get(key, 0) + 1
-    winner = max(counts, key=lambda key: (counts[key], len(key)))
-    best = max(
-        (item for item in results if _normalized(item[0]) == winner),
-        key=lambda item: item[1],
-    )
-    return best
+    run_pass(fallback=False)
+    text, confidence, consensus = _select_ocr_result(results)
+
+    # Só gasta CPU extra quando a primeira leitura realmente parece ruim.
+    if not text or confidence < 58.0 or consensus < 0.58:
+        run_pass(fallback=True)
+        text, confidence, _consensus = _select_ocr_result(results)
+
+    return text, confidence
