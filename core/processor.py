@@ -1,698 +1,521 @@
 from __future__ import annotations
 
-import difflib
-import functools
-import re
+import math
 import shutil
-import subprocess
-import threading
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable
 
-import regex
-from PIL import Image, ImageDraw, ImageFont
+from .captions import (
+    CaptionEvent,
+    CaptionOverlay,
+    manual_caption,
+    read_burned_caption,
+    render_caption_overlays,
+    transcribe_intro,
+)
+from .config import (
+    BACKGROUND_BLUR_DIVISOR,
+    FFMPEG_THREADS,
+    MAX_VIDEO_MINUTES,
+    OUTPUT_AUDIO_BITRATE,
+    OUTPUT_CRF,
+    OUTPUT_MAX_LONG_EDGE,
+    OUTPUT_PRESET,
+    TEMP_MAX_AGE_HOURS,
+    WORK_ROOT,
+)
+from .media import MediaError, PreparedIntroMedia, prepare_intro_media, probe_video, require_binary, run_command
+from .transition import TransitionResult, detect_intro_end
 
-from .config import CAPTION_FONT, DEFAULT_LANGUAGE, WHISPER_COMPUTE_TYPE, WHISPER_DEVICE, WHISPER_MODEL
-from .media import MediaError, require_binary, run_command
+ProgressFn = Callable[[float, str], None]
 
 
 @dataclass(frozen=True)
-class CaptionEvent:
-    start: float
-    end: float
-    text: str
+class ProcessResult:
+    output_path: str
+    report: str
+    transition_seconds: float
 
 
-@dataclass(frozen=True)
-class CaptionOverlay:
-    start: float
-    end: float
-    path: str
-
-
-_MODEL = None
-_MODEL_LOCK = threading.Lock()
-
-
-def _get_whisper_model():
-    global _MODEL
-    if _MODEL is not None:
-        return _MODEL
-    with _MODEL_LOCK:
-        if _MODEL is not None:
-            return _MODEL
+def cleanup_old_jobs() -> None:
+    cutoff = time.time() - TEMP_MAX_AGE_HOURS * 3600
+    WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    for item in WORK_ROOT.iterdir():
         try:
-            from faster_whisper import WhisperModel
-        except ImportError as exc:
-            raise MediaError(
-                "A transcrição automática não está instalada. Execute 'pip install -r requirements.txt' "
-                "ou use a opção de legenda manual."
-            ) from exc
-        try:
-            _MODEL = WhisperModel(
-                WHISPER_MODEL,
-                device=WHISPER_DEVICE,
-                compute_type=WHISPER_COMPUTE_TYPE,
-            )
-        except Exception as exc:
-            message = str(exc)
-            if (
-                "ConnectError" in message
-                or "LocalEntryNotFoundError" in type(exc).__name__
-                or "internet connection" in message.lower()
-            ):
-                raise MediaError(
-                    "Não foi possível baixar o modelo de transcrição. Verifique a conexão de internet "
-                    "do servidor e tente novamente. No Railway, a primeira transcrição baixa o modelo "
-                    "configurado em WHISPER_MODEL."
-                ) from exc
-            raise MediaError(f"Não foi possível carregar o modelo Whisper: {message}") from exc
-        return _MODEL
-
-
-def extract_audio_for_transcription(
-    video_path: str | Path,
-    output_wav: str | Path,
-    duration: float,
-) -> None:
-    ffmpeg = require_binary("ffmpeg")
-    run_command(
-        [
-            ffmpeg,
-            "-y",
-            "-v",
-            "error",
-            "-i",
-            str(video_path),
-            "-t",
-            f"{duration:.3f}",
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            str(output_wav),
-        ],
-        timeout=max(120, int(duration * 5)),
-    )
-
-
-def _clean_word(word: str) -> str:
-    return re.sub(r"\s+", " ", word).strip()
-
-
-def _group_words(words: Iterable, *, max_words: int = 5, max_duration: float = 2.3) -> list[CaptionEvent]:
-    events: list[CaptionEvent] = []
-    current: list = []
-
-    def flush() -> None:
-        nonlocal current
-        if not current:
-            return
-        text = " ".join(_clean_word(item.word) for item in current).strip()
-        if text:
-            events.append(
-                CaptionEvent(
-                    start=max(0.0, float(current[0].start)),
-                    end=max(float(current[-1].end), float(current[0].start) + 0.12),
-                    text=text,
-                )
-            )
-        current = []
-
-    for word in words:
-        if word.start is None or word.end is None:
-            continue
-        cleaned = _clean_word(word.word)
-        if not cleaned:
-            continue
-        if current:
-            current_duration = float(word.end) - float(current[0].start)
-            sentence_break = bool(re.search(r"[.!?…]$", _clean_word(current[-1].word)))
-            if len(current) >= max_words or current_duration > max_duration or sentence_break:
-                flush()
-        current.append(word)
-    flush()
-    return events
-
-
-def transcribe_intro(
-    video_path: str | Path,
-    work_dir: str | Path,
-    duration: float,
-    *,
-    language: str | None = DEFAULT_LANGUAGE,
-) -> tuple[list[CaptionEvent], str]:
-    work = Path(work_dir)
-    wav_path = work / "intro_audio.wav"
-    extract_audio_for_transcription(video_path, wav_path, duration)
-
-    model = _get_whisper_model()
-    try:
-        segments, info = model.transcribe(
-            str(wav_path),
-            language=language or None,
-            beam_size=3,
-            vad_filter=True,
-            word_timestamps=True,
-            condition_on_previous_text=False,
-        )
-        words = []
-        full_text: list[str] = []
-        for segment in segments:
-            if segment.text:
-                full_text.append(segment.text.strip())
-            if segment.words:
-                words.extend(segment.words)
-        events = _group_words(words)
-        detected_language = getattr(info, "language", None) or language or "desconhecido"
-    except Exception as exc:
-        raise MediaError(f"Falha durante a transcrição automática: {exc}") from exc
-
-    clipped = [
-        CaptionEvent(event.start, min(event.end, duration), event.text)
-        for event in events
-        if event.start < duration and event.end > 0
-    ]
-    return clipped, " ".join(full_text).strip() + f"\nIdioma: {detected_language}"
-
-
-def manual_caption(text: str, duration: float) -> list[CaptionEvent]:
-    # Mantém todo Unicode, inclusive emojis, ZWJ, tons de pele e seletores de variação.
-    cleaned = re.sub(r"[\t\r\f\v ]+", " ", text or "")
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-    if not cleaned:
-        return []
-    return [CaptionEvent(0.0, max(0.15, duration), cleaned)]
-
-
-def _fc_match(pattern: str) -> str | None:
-    executable = shutil.which("fc-match")
-    if not executable:
-        return None
-    try:
-        result = subprocess.run(
-            [executable, "-f", "%{file}\n", pattern],
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    candidate = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
-    return candidate if candidate and Path(candidate).exists() else None
-
-
-def _normal_font_path() -> str:
-    candidates = [
-        _fc_match(f"{CAPTION_FONT}:style=Bold"),
-        _fc_match(CAPTION_FONT),
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        r"C:\Windows\Fonts\arialbd.ttf",
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return str(candidate)
-    raise MediaError("Não foi encontrada uma fonte para renderizar as legendas.")
-
-
-def _emoji_font_path() -> str | None:
-    candidates = [
-        _fc_match("Noto Color Emoji"),
-        _fc_match("Segoe UI Emoji"),
-        _fc_match("Apple Color Emoji"),
-        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-        r"C:\Windows\Fonts\seguiemj.ttf",
-        "/System/Library/Fonts/Apple Color Emoji.ttc",
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return str(candidate)
-    return None
-
-
-def _is_emoji_cluster(cluster: str) -> bool:
-    for char in cluster:
-        code = ord(char)
-        if (
-            0x1F000 <= code <= 0x1FAFF
-            or 0x2600 <= code <= 0x27BF
-            or 0x2300 <= code <= 0x23FF
-            or 0x2B00 <= code <= 0x2BFF
-            or code in {0x200D, 0x20E3, 0xFE0F}
-        ):
-            return True
-    return False
-
-
-@functools.lru_cache(maxsize=512)
-def _render_emoji(cluster: str, target_height: int, font_path: str) -> Image.Image:
-    # Noto Color Emoji possui uma strike bitmap de 109 px. Outras fontes podem ser escaláveis.
-    font = None
-    for candidate_size in (target_height, 109, 128, 96, 64, 32):
-        try:
-            font = ImageFont.truetype(font_path, candidate_size)
-            break
+            if item.is_dir() and item.stat().st_mtime < cutoff:
+                shutil.rmtree(item, ignore_errors=True)
         except OSError:
             continue
-    if font is None:
-        raise MediaError("A fonte de emoji instalada não pôde ser carregada.")
-
-    probe = Image.new("RGBA", (320, 320), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(probe)
-    try:
-        bbox = draw.textbbox((0, 0), cluster, font=font, embedded_color=True)
-    except TypeError:
-        bbox = draw.textbbox((0, 0), cluster, font=font)
-    width = max(1, bbox[2] - bbox[0])
-    height = max(1, bbox[3] - bbox[1])
-    glyph = Image.new("RGBA", (width + 12, height + 12), (0, 0, 0, 0))
-    glyph_draw = ImageDraw.Draw(glyph)
-    position = (6 - bbox[0], 6 - bbox[1])
-    try:
-        glyph_draw.text(position, cluster, font=font, embedded_color=True)
-    except TypeError:
-        glyph_draw.text(position, cluster, font=font, fill="white")
-
-    alpha_bbox = glyph.getchannel("A").getbbox()
-    if alpha_bbox:
-        glyph = glyph.crop(alpha_bbox)
-    if glyph.height != target_height and glyph.height > 0:
-        target_width = max(1, int(round(glyph.width * target_height / glyph.height)))
-        glyph = glyph.resize((target_width, target_height), Image.Resampling.LANCZOS)
-    return glyph
 
 
-def _clusters(text: str) -> list[str]:
-    return regex.findall(r"\X", text)
+def _safe_progress(progress: ProgressFn | None, value: float, description: str) -> None:
+    if progress:
+        progress(max(0.0, min(1.0, value)), description)
 
 
-def _cluster_width(
-    cluster: str,
-    normal_font: ImageFont.FreeTypeFont,
-    emoji_height: int,
-    emoji_font_path: str | None,
-) -> float:
-    if _is_emoji_cluster(cluster) and emoji_font_path:
-        return float(_render_emoji(cluster, emoji_height, emoji_font_path).width)
-    return float(normal_font.getlength(cluster))
+def _fit_filter(label: str, width: int, height: int, fps: float, mode: str) -> tuple[str, str]:
+    fps_text = f"{fps:.6f}".rstrip("0").rstrip(".")
+    common_tail = f"setsar=1,settb=AVTB,fps={fps_text},format=yuv420p"
 
-
-def _token_clusters(text: str) -> list[list[str]]:
-    tokens: list[list[str]] = []
-    for token in regex.findall(r"\s+|\S+", text):
-        tokens.append(_clusters(token))
-    return tokens
-
-
-def _wrap_lines(
-    text: str,
-    *,
-    normal_font: ImageFont.FreeTypeFont,
-    emoji_height: int,
-    emoji_font_path: str | None,
-    max_width: int,
-) -> tuple[list[list[str]], list[float]]:
-    lines: list[list[str]] = []
-    widths: list[float] = []
-
-    paragraphs = text.split("\n")
-    for paragraph_index, paragraph in enumerate(paragraphs):
-        current: list[str] = []
-        current_width = 0.0
-        for token in _token_clusters(paragraph):
-            token_width = sum(
-                _cluster_width(cluster, normal_font, emoji_height, emoji_font_path)
-                for cluster in token
-            )
-            is_space = all(cluster.isspace() for cluster in token)
-            if is_space and not current:
-                continue
-
-            if current and current_width + token_width > max_width and not is_space:
-                while current and current[-1].isspace():
-                    removed = current.pop()
-                    current_width -= _cluster_width(removed, normal_font, emoji_height, emoji_font_path)
-                lines.append(current)
-                widths.append(max(0.0, current_width))
-                current = []
-                current_width = 0.0
-
-            if token_width > max_width and not is_space:
-                for cluster in token:
-                    width = _cluster_width(cluster, normal_font, emoji_height, emoji_font_path)
-                    if current and current_width + width > max_width:
-                        lines.append(current)
-                        widths.append(current_width)
-                        current = []
-                        current_width = 0.0
-                    current.append(cluster)
-                    current_width += width
-            else:
-                current.extend(token)
-                current_width += token_width
-
-        while current and current[-1].isspace():
-            removed = current.pop()
-            current_width -= _cluster_width(removed, normal_font, emoji_height, emoji_font_path)
-        lines.append(current)
-        widths.append(max(0.0, current_width))
-
-        if paragraph_index < len(paragraphs) - 1 and not current:
-            # Preserva uma linha vazia explícita sem criar vazias infinitas.
-            pass
-
-    return lines or [[]], widths or [0.0]
-
-
-def _render_caption_canvas(
-    text: str,
-    *,
-    width: int,
-    height: int,
-    font_percent: float,
-    position: str,
-) -> Image.Image:
-    normal_path = _normal_font_path()
-    emoji_path = _emoji_font_path()
-    requested_size = max(24, int(round(height * max(2.0, min(font_percent, 9.0)) / 100.0)))
-    max_text_width = int(round(width * 0.90))
-
-    font_size = requested_size
-    while True:
-        normal_font = ImageFont.truetype(normal_path, font_size)
-        emoji_height = max(18, int(round(font_size * 1.18)))
-        lines, line_widths = _wrap_lines(
-            text,
-            normal_font=normal_font,
-            emoji_height=emoji_height,
-            emoji_font_path=emoji_path,
-            max_width=max_text_width,
+    if mode == "Preencher a tela (pode cortar bordas)":
+        chain = (
+            f"[{label}]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},{common_tail}[cont]"
         )
-        if len(lines) <= 3 or font_size <= 22:
-            break
-        font_size = max(22, int(round(font_size * 0.90)))
+        return chain, "cont"
 
-    if len(lines) > 3:
-        merged = lines[:2]
-        merged.append([cluster for line in lines[2:] for cluster in ([" "] + line)])
-        lines = merged
-        line_widths = [
-            sum(_cluster_width(cluster, normal_font, emoji_height, emoji_path) for cluster in line)
-            for line in lines
-        ]
-
-    ascent, descent = normal_font.getmetrics()
-    line_height = max(int(round(font_size * 1.34)), emoji_height + max(2, descent // 3))
-    block_height = line_height * len(lines)
-    margin_v = max(20, int(round(height * 0.08)))
-    if position == "Centro inferior":
-        top = max(0, height - margin_v - block_height)
-    elif position == "Centro superior":
-        top = margin_v
-    else:
-        top = max(0, (height - block_height) // 2)
-
-    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(canvas)
-    outline = max(2, int(round(font_size * 0.075)))
-
-    for line_index, (line, line_width) in enumerate(zip(lines, line_widths)):
-        x = (width - line_width) / 2.0
-        baseline = top + line_index * line_height + ascent
-        for cluster in line:
-            if _is_emoji_cluster(cluster) and emoji_path:
-                emoji_image = _render_emoji(cluster, emoji_height, emoji_path)
-                emoji_top = int(round(baseline - emoji_image.height + max(0, descent * 0.20)))
-                emoji_x = int(round(x))
-                # Sombra curta para manter legibilidade em fundos claros.
-                shadow = Image.new("RGBA", emoji_image.size, (0, 0, 0, 0))
-                shadow.putalpha(emoji_image.getchannel("A").point(lambda value: int(value * 0.65)))
-                canvas.alpha_composite(shadow, (emoji_x + outline, emoji_top + outline))
-                canvas.alpha_composite(emoji_image, (emoji_x, emoji_top))
-                x += emoji_image.width
-            else:
-                if not cluster.isspace():
-                    draw.text(
-                        (x, baseline),
-                        cluster,
-                        font=normal_font,
-                        fill=(255, 255, 255, 255),
-                        stroke_width=outline,
-                        stroke_fill=(0, 0, 0, 255),
-                        anchor="ls",
-                    )
-                x += normal_font.getlength(cluster)
-
-    return canvas
-
-
-def render_caption_overlays(
-    events: list[CaptionEvent],
-    work_dir: str | Path,
-    *,
-    width: int,
-    height: int,
-    font_percent: float,
-    position: str,
-) -> list[CaptionOverlay]:
-    output_dir = Path(work_dir) / "caption_overlays"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    overlays: list[CaptionOverlay] = []
-
-    for index, event in enumerate(events):
-        canvas = _render_caption_canvas(
-            event.text,
-            width=width,
-            height=height,
-            font_percent=font_percent,
-            position=position,
+    if mode == "Barras pretas":
+        chain = (
+            f"[{label}]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,{common_tail}[cont]"
         )
-        path = output_dir / f"caption_{index:03d}.png"
-        canvas.save(path, format="PNG", optimize=True)
-        overlays.append(CaptionOverlay(event.start, event.end, str(path)))
+        return chain, "cont"
 
-    return overlays
-
-
-# ====================== LEITURA DA LEGENDA QUEIMADA (OCR) ======================
-
-_OCR_LANGUAGE_MAP = {"pt": "por", "en": "eng", "es": "spa"}
-
-
-def _ocr_grab_frame(video_path: str | Path, time_sec: float):
-    import cv2
-
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return None
-    try:
-        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, time_sec) * 1000.0)
-        ok, frame = cap.read()
-        return frame if ok else None
-    finally:
-        cap.release()
-
-
-def _ocr_variants(frame):
-    """Prepara duas versões do quadro: cinza puro e 'texto branco isolado'.
-
-    Legendas de reels costumam ser texto branco com contorno preto. Isolar os
-    pixels quase brancos remove o fundo e melhora muito o reconhecimento.
-    """
-    import cv2
-    import numpy as np
-
-    height, width = frame.shape[:2]
-    if width < 1000:
-        scale = 1000.0 / width
-        frame = cv2.resize(frame, (1000, int(round(height * scale))), interpolation=cv2.INTER_CUBIC)
-
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    white = (gray >= 200).astype(np.uint8) * 255
-    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    isolated = 255 - white
-    return [gray, isolated]
-
-
-def _ocr_frame(image, lang: str) -> tuple[str, float]:
-    import pytesseract
-    from pytesseract import Output
-
-    data = pytesseract.image_to_data(image, lang=lang, config="--psm 6", output_type=Output.DICT)
-    lines: dict[tuple[int, int, int], list[str]] = {}
-    confidences: list[float] = []
-    for index in range(len(data["text"])):
-        token = (data["text"][index] or "").strip()
-        try:
-            confidence = float(data["conf"][index])
-        except (TypeError, ValueError):
-            continue
-        if not token or confidence < 55:
-            continue
-        if not re.search(r"[\wÀ-ÿ]", token):
-            continue
-        key = (data["block_num"][index], data["par_num"][index], data["line_num"][index])
-        lines.setdefault(key, []).append(token)
-        confidences.append(confidence)
-
-    text = "\n".join(" ".join(words) for _key, words in sorted(lines.items())).strip()
-    average = sum(confidences) / len(confidences) if confidences else 0.0
-    return text, average
-
-
-def _ocr_frame_best(frame, lang: str) -> tuple[str, float]:
-    """Roda as variantes do quadro (cinza / texto isolado) e fica com a de maior confiança.
-
-    Antes, as leituras de TODOS os quadros e variantes iam para um único
-    balaio e a função escolhia por votação global qual string era mais
-    comum. Isso só funciona se a legenda for estática. Quando ela muda de
-    frase ao longo do take (efeito karaokê, vários cartões de texto — muito
-    comum em Reels/TikTok), cada quadro tem um texto diferente e o "voto"
-    acaba pegando um fragmento qualquer em vez da legenda inteira. Aqui cada
-    quadro contribui com UMA leitura representativa; quem reconstrói a
-    legenda completa em ordem cronológica é ``read_burned_caption``.
-    """
-    best_text = ""
-    best_conf = 0.0
-    for variant in _ocr_variants(frame):
-        text, confidence = _ocr_frame(variant, lang)
-        if text and (not best_text or confidence > best_conf):
-            best_text, best_conf = text, confidence
-    return best_text, best_conf
-
-
-def _normalized_ocr(value: str) -> str:
-    return re.sub(r"\s+", " ", value.lower()).strip()
-
-
-def _ocr_similarity(a: str, b: str) -> float:
-    """Similaridade 0-1 entre duas leituras, tolerando o ruído normal do OCR."""
-    if not a or not b:
-        return 0.0
-    return difflib.SequenceMatcher(None, a, b).ratio()
-
-
-# Duas leituras do mesmo "cartão" de legenda quase nunca saem idênticas do
-# OCR (ruído de compressão, motion blur etc.). Este limiar decide quando duas
-# leituras em sequência ainda contam como "o mesmo texto" versus uma troca
-# real de frase. Ajuste para cima se cartões diferentes estiverem sendo
-# fundidos em um só; para baixo se um único texto estático estiver sendo
-# picotado em vários pedaços.
-_OCR_SIMILARITY_THRESHOLD = 0.72
-
-
-def read_burned_caption(
-    video_path: str | Path,
-    duration: float,
-    *,
-    language: str = "",
-) -> tuple[list[CaptionEvent], str]:
-    """Lê o(s) texto(s) escrito(s) (queimado) nos quadros do primeiro take.
-
-    Amostra vários quadros ao longo do take — o número se adapta à duração,
-    com piso de 5 e teto de 16 amostras para não pesar demais no
-    processamento — e reconstrói a legenda EM ORDEM CRONOLÓGICA: leituras
-    parecidas em sequência viram um único "cartão" de texto (ficando com a
-    leitura de maior confiança entre elas); leituras claramente diferentes
-    viram cartões separados, cada um com seu próprio intervalo de tempo. Isso
-    evita que uma legenda que muda de frase durante o take seja reduzida a um
-    fragmento aleatório, e evita amontoar textos de momentos diferentes numa
-    única legenda com linhas que não têm relação entre si.
-
-    Retorna uma lista de ``CaptionEvent`` já com tempo definido (prontos para
-    ``render_caption_overlays``) e um resumo em texto para o relatório.
-    Emojis não são reconhecidos por OCR e ficam de fora do texto lido — use
-    'Usar um texto fixo' para legendas com emoji.
-    """
-    try:
-        import pytesseract
-    except ImportError as exc:
-        raise MediaError(
-            "A leitura da legenda do vídeo requer o pacote 'pytesseract'. "
-            "Execute 'pip install -r requirements.txt'."
-        ) from exc
-
-    try:
-        available = set(pytesseract.get_languages(config=""))
-    except Exception as exc:
-        raise MediaError(
-            "O programa Tesseract OCR não foi encontrado. No Docker/Railway ele é instalado "
-            "automaticamente; no Windows instale em https://github.com/UB-Mannheim/tesseract/wiki."
-        ) from exc
-
-    preferred = _OCR_LANGUAGE_MAP.get((language or "").strip().lower())
-    langs = [code for code in [preferred, "por", "eng"] if code and code in available]
-    lang = "+".join(dict.fromkeys(langs)) or "eng"
-
-    # Amostragem adaptativa: ~1 quadro a cada 0.6s, piso de 5 e teto de 16
-    # amostras (um take de 3s fica com 5-6 amostras; um de 20s fica no teto).
-    step = 0.6
-    sample_count = max(5, min(16, int(duration / step) + 1))
-    timestamps = [duration * (index + 0.5) / sample_count for index in range(sample_count)]
-
-    per_frame: list[tuple[float, str, float]] = []
-    for timestamp in timestamps:
-        frame = _ocr_grab_frame(video_path, timestamp)
-        if frame is None:
-            continue
-        try:
-            text, confidence = _ocr_frame_best(frame, lang)
-        except Exception as exc:
-            raise MediaError(f"Falha ao ler a legenda do vídeo: {exc}") from exc
-        if text:
-            per_frame.append((timestamp, text, confidence))
-
-    if not per_frame:
-        return [], ""
-
-    # Agrupa leituras vizinhas parecidas em "cartões" cronológicos.
-    cards: list[dict] = []
-    for timestamp, text, confidence in per_frame:
-        norm = _normalized_ocr(text)
-        if cards and _ocr_similarity(norm, cards[-1]["norm"]) >= _OCR_SIMILARITY_THRESHOLD:
-            card = cards[-1]
-            card["variants"].append((text, confidence))
-            card["end"] = timestamp
-            card["norm"] = norm
-        else:
-            cards.append(
-                {"variants": [(text, confidence)], "norm": norm, "start": timestamp, "end": timestamp}
-            )
-
-    # Estende cada cartão até o início do próximo (sem deixar buracos) e faz
-    # o primeiro/último cobrirem as pontas do take.
-    for index in range(len(cards) - 1):
-        cards[index]["end"] = cards[index + 1]["start"]
-    cards[0]["start"] = 0.0
-    cards[-1]["end"] = max(duration, cards[-1]["end"])
-
-    events: list[CaptionEvent] = []
-    confidences: list[float] = []
-    for card in cards:
-        best_text, best_confidence = max(card["variants"], key=lambda item: item[1])
-        # Leitura isolada (apareceu 1 única vez) e de baixa confiança: mais
-        # provável ser ruído (ícone, reflexo, textura) do que texto real.
-        if len(card["variants"]) == 1 and best_confidence < 60:
-            continue
-        start = max(0.0, min(card["start"], duration))
-        end = max(start + 0.15, min(card["end"], duration))
-        events.append(CaptionEvent(start=start, end=end, text=best_text))
-        confidences.append(best_confidence)
-
-    if not events:
-        return [], ""
-
-    average = sum(confidences) / len(confidences)
-    summary_text = "\n".join(event.text for event in events)
-    summary = (
-        f"Legenda lida do vídeo original (confiança {average:.0f}%):\n{summary_text}\n"
-        "Emojis não são reconhecidos pelo OCR; se a original tiver emoji, use o texto fixo."
+    bg_width = max(2, (width // BACKGROUND_BLUR_DIVISOR) // 2 * 2)
+    bg_height = max(2, (height // BACKGROUND_BLUR_DIVISOR) // 2 * 2)
+    chain = (
+        f"[{label}]split=2[bgsrc][fgsrc];"
+        f"[bgsrc]scale={bg_width}:{bg_height}:force_original_aspect_ratio=increase,"
+        f"crop={bg_width}:{bg_height},gblur=sigma=12,"
+        f"scale={width}:{height}:flags=bilinear[bg];"
+        f"[fgsrc]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2,{common_tail}[cont]"
     )
-    return events, summary
+    return chain, "cont"
+
+
+def _render_normalized_intro(
+    media: PreparedIntroMedia,
+    output_path: Path,
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    duration: float,
+) -> None:
+    """Cria um MP4 sem áudio contendo somente a nova mídia do primeiro take.
+
+    A normalização em uma etapa separada evita que timestamps, rotação, VFR,
+    codecs de celular ou o uso de ``-stream_loop`` interfiram na concatenação
+    final e façam o vídeo original aparecer no lugar da mídia enviada.
+    """
+    ffmpeg = require_binary("ffmpeg")
+    fps_text = f"{fps:.6f}".rstrip("0").rstrip(".")
+
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+    ]
+    if media.kind == "image":
+        command.extend([
+            "-loop",
+            "1",
+            "-framerate",
+            fps_text,
+            "-i",
+            media.input_path,
+        ])
+    else:
+        # Repete somente o vídeo novo quando ele for menor que o primeiro take.
+        command.extend(["-stream_loop", "-1", "-i", media.input_path])
+
+    filter_graph = (
+        f"[0:v]trim=duration={duration:.6f},setpts=PTS-STARTPTS,"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"setsar=1,settb=AVTB,fps={fps_text},format=yuv420p[vintro]"
+    )
+
+    command.extend([
+        "-filter_threads",
+        str(FFMPEG_THREADS),
+        "-filter_complex_threads",
+        str(FFMPEG_THREADS),
+        "-filter_complex",
+        filter_graph,
+        "-map",
+        "[vintro]",
+        "-t",
+        f"{duration:.6f}",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        OUTPUT_PRESET,
+        "-crf",
+        str(OUTPUT_CRF),
+        "-pix_fmt",
+        "yuv420p",
+        "-threads",
+        str(FFMPEG_THREADS),
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ])
+
+    run_command(command, timeout=max(180, int(duration * 20)))
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        raise MediaError("Não foi possível preparar o vídeo enviado para o primeiro take.")
+
+    normalized = probe_video(output_path)
+    if normalized.duration + 0.08 < duration:
+        raise MediaError(
+            "O vídeo enviado para o primeiro take terminou antes do esperado durante a preparação."
+        )
+
+
+def _build_filter_complex(
+    *,
+    width: int,
+    height: int,
+    fps: float,
+    duration: float,
+    transition: float,
+    has_continuation: bool,
+    fit_mode: str,
+    caption_overlays: list[CaptionOverlay],
+    has_audio: bool,
+) -> tuple[str, str, str | None]:
+    fps_text = f"{fps:.6f}".rstrip("0").rstrip(".")
+    chains: list[str] = []
+
+    intro_duration = transition if has_continuation else duration
+    chains.append(
+        f"[0:v]trim=duration={intro_duration:.6f},setpts=PTS-STARTPTS,"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"setsar=1,settb=AVTB,fps={fps_text},format=yuv420p[introbase]"
+    )
+
+    intro_label = "introbase"
+    for index, overlay in enumerate(caption_overlays):
+        input_index = 2 + index
+        source_label = f"caption{index}src"
+        output_label = f"introcaption{index}"
+        chains.append(f"[{input_index}:v]format=rgba[{source_label}]")
+        # A imagem da legenda entra em loop no FFmpeg. Sem shortest/trim, o filtro
+        # overlay pode prolongar o primeiro take indefinidamente e congelar seu
+        # último quadro, impedindo a concatenação com a continuação.
+        chains.append(
+            f"[{intro_label}][{source_label}]overlay=0:0:"
+            f"shortest=1:eof_action=pass:repeatlast=0:"
+            f"enable='between(t,{overlay.start:.3f},{overlay.end:.3f})'[{output_label}]"
+        )
+        intro_label = output_label
+
+    # Garantia adicional: independentemente das camadas aplicadas, o primeiro
+    # segmento termina exatamente no segundo da troca.
+    chains.append(
+        f"[{intro_label}]trim=duration={intro_duration:.6f},"
+        f"setpts=PTS-STARTPTS[introready]"
+    )
+    intro_label = "introready"
+
+    if has_continuation:
+        # Margem de segurança de ~2 quadros: vídeos de celular (VFR) podem ter
+        # timestamps levemente imprecisos e deixar 1-2 quadros da cena antiga
+        # "vazarem" no início da continuação. Pular 0.07s do vídeo original a
+        # partir da troca elimina isso sem efeito visível no take de continuação.
+        safety_margin = 0.07
+        continuation_start = min(transition + safety_margin, max(transition, duration - 0.05))
+        chains.append(
+            f"[1:v]trim=start={continuation_start:.6f},setpts=PTS-STARTPTS[contsrc]"
+        )
+        fit_chain, cont_label = _fit_filter("contsrc", width, height, fps, fit_mode)
+        chains.append(fit_chain)
+        chains.append(f"[{intro_label}][{cont_label}]concat=n=2:v=1:a=0[vout]")
+    else:
+        chains.append(f"[{intro_label}]null[vout]")
+
+    audio_label: str | None = None
+    if has_audio:
+        chains.append("[1:a:0]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[aout]")
+        audio_label = "aout"
+
+    return ";".join(chains), "vout", audio_label
+
+
+def _resolve_transition(
+    video_path: str,
+    video_duration: float,
+    transition_mode: str,
+    manual_seconds: float | None,
+) -> tuple[float, TransitionResult | None, bool]:
+    if transition_mode == "Sem vídeo de continuação":
+        return video_duration, None, False
+
+    if transition_mode == "Informar o segundo manualmente":
+        if manual_seconds is None or not math.isfinite(float(manual_seconds)):
+            raise MediaError("Digite o segundo em que começa o vídeo de continuação.")
+        transition = float(manual_seconds)
+        if transition <= 0 or transition >= video_duration:
+            raise MediaError(
+                f"O segundo da transição deve ser maior que 0 e menor que {video_duration:.2f}s."
+            )
+        return transition, None, True
+
+    detected = detect_intro_end(video_path)
+    if detected.seconds is None:
+        return video_duration, detected, False
+    transition = min(max(detected.seconds, 0.1), video_duration - 0.05)
+    return transition, detected, True
+
+
+
+def process_video(
+    *,
+    photo_path: str,
+    video_path: str,
+    transition_mode: str,
+    manual_transition_seconds: float | None,
+    caption_mode: str,
+    manual_caption_text: str,
+    caption_position: str,
+    caption_font_percent: float,
+    continuation_fit_mode: str,
+    language: str,
+    progress: ProgressFn | None = None,
+) -> ProcessResult:
+    """Gera o vídeo final. ``photo_path`` aceita imagem ou vídeo por compatibilidade de API."""
+
+    cleanup_old_jobs()
+    require_binary("ffmpeg")
+    require_binary("ffprobe")
+
+    if not photo_path:
+        raise MediaError("Envie a nova mídia da personagem: uma imagem ou um vídeo.")
+    if not video_path:
+        raise MediaError("Envie o vídeo original com áudio e, quando existir, o trecho de continuação.")
+
+    job_dir = WORK_ROOT / uuid.uuid4().hex
+    job_dir.mkdir(parents=True, exist_ok=False)
+    output_path = job_dir / "video_pronto.mp4"
+    normalized_intro_path = job_dir / "primeiro_take_normalizado.mp4"
+
+    _safe_progress(progress, 0.04, "Lendo os arquivos...")
+    info = probe_video(video_path)
+    if info.duration <= 0:
+        raise MediaError("A duração do vídeo original é inválida.")
+    if info.duration > MAX_VIDEO_MINUTES * 60:
+        raise MediaError(
+            f"O vídeo original tem {info.duration / 60:.1f} minutos. O limite configurado é "
+            f"{MAX_VIDEO_MINUTES:.0f} minutos."
+        )
+
+    intro_media = prepare_intro_media(
+        photo_path,
+        job_dir,
+        max_long_edge=OUTPUT_MAX_LONG_EDGE,
+    )
+    if intro_media.kind == "video" and (intro_media.duration or 0) <= 0:
+        raise MediaError("O vídeo enviado como mídia inicial possui duração inválida.")
+
+    output_w = intro_media.output_width
+    output_h = intro_media.output_height
+
+    _safe_progress(progress, 0.16, "Identificando onde termina o primeiro take...")
+    transition, detection, has_continuation = _resolve_transition(
+        video_path,
+        info.duration,
+        transition_mode,
+        manual_transition_seconds,
+    )
+    intro_duration = transition if has_continuation else info.duration
+
+    caption_events: list[CaptionEvent] = []
+    transcript_summary = ""
+    if caption_mode == "Transcrever o áudio automaticamente":
+        if not info.has_audio:
+            raise MediaError("O vídeo original não possui áudio para transcrever. Use legenda manual ou sem legenda.")
+        _safe_progress(progress, 0.30, "Transcrevendo o áudio do primeiro take...")
+        caption_events, transcript_summary = transcribe_intro(
+            video_path,
+            job_dir,
+            intro_duration,
+            language=language or None,
+        )
+        if not caption_events:
+            transcript_summary = "O Whisper não encontrou fala clara no primeiro trecho."
+    elif caption_mode == "Copiar o texto escrito no vídeo original":
+        _safe_progress(progress, 0.30, "Lendo a legenda escrita no primeiro take...")
+        caption_events, transcript_summary = read_burned_caption(
+            video_path,
+            intro_duration,
+            language=language or "pt",
+        )
+        if not caption_events:
+            raise MediaError(
+                "Não foi possível ler nenhuma legenda escrita no primeiro take. "
+                "Use 'Usar um texto fixo' e digite a legenda manualmente."
+            )
+    elif caption_mode == "Usar um texto fixo":
+        caption_events = manual_caption(manual_caption_text, intro_duration)
+        if not caption_events:
+            raise MediaError("Digite o texto da legenda manual.")
+
+    caption_overlays: list[CaptionOverlay] = []
+    if caption_events:
+        caption_overlays = render_caption_overlays(
+            caption_events,
+            job_dir,
+            width=output_w,
+            height=output_h,
+            font_percent=float(caption_font_percent),
+            position=caption_position,
+        )
+
+    media_word = "vídeo" if intro_media.kind == "video" else "imagem"
+    _safe_progress(progress, 0.46, f"Preparando o {media_word} enviado para o primeiro take...")
+    _render_normalized_intro(
+        intro_media,
+        normalized_intro_path,
+        width=output_w,
+        height=output_h,
+        fps=info.fps,
+        duration=intro_duration,
+    )
+
+    _safe_progress(progress, 0.60, "Juntando o novo primeiro take ao vídeo original...")
+    filter_complex, video_label, audio_label = _build_filter_complex(
+        width=output_w,
+        height=output_h,
+        fps=info.fps,
+        duration=info.duration,
+        transition=transition,
+        has_continuation=has_continuation,
+        fit_mode=continuation_fit_mode,
+        caption_overlays=caption_overlays,
+        has_audio=info.has_audio,
+    )
+
+    ffmpeg = require_binary("ffmpeg")
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-filter_threads",
+        str(FFMPEG_THREADS),
+        "-filter_complex_threads",
+        str(FFMPEG_THREADS),
+    ]
+    # O input 0 é sempre o trecho já normalizado da nova mídia. O original
+    # permanece exclusivamente no input 1 e só é usado após a transição.
+    command.extend(["-i", str(normalized_intro_path)])
+    command.extend(["-i", str(video_path)])
+    for overlay in caption_overlays:
+        command.extend([
+            "-loop",
+            "1",
+            "-framerate",
+            f"{info.fps:.6f}",
+            "-i",
+            overlay.path,
+        ])
+    command.extend(
+        [
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            f"[{video_label}]",
+        ]
+    )
+    if audio_label:
+        command.extend(["-map", f"[{audio_label}]"])
+
+    command.extend(
+        [
+            "-t",
+            f"{info.duration:.6f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            OUTPUT_PRESET,
+            "-crf",
+            str(OUTPUT_CRF),
+            "-pix_fmt",
+            "yuv420p",
+            "-threads",
+            str(FFMPEG_THREADS),
+            "-movflags",
+            "+faststart",
+        ]
+    )
+    if audio_label:
+        command.extend(["-c:a", "aac", "-b:a", OUTPUT_AUDIO_BITRATE])
+    else:
+        command.append("-an")
+    command.extend(["-max_muxing_queue_size", "2048", str(output_path)])
+
+    timeout = max(240, int(info.duration * 25))
+    run_command(command, timeout=timeout)
+    if not output_path.exists() or output_path.stat().st_size < 1024:
+        raise MediaError("O FFmpeg terminou sem produzir um vídeo válido.")
+
+    _safe_progress(progress, 0.96, "Validando o vídeo final...")
+    final_info = probe_video(output_path)
+
+    detection_line = ""
+    if detection:
+        detection_line = f"\n- Detecção: {detection.message} Confiança aproximada: {detection.confidence:.0%}."
+    if has_continuation:
+        structure_line = (
+            f"- Nova mídia e legenda: 0s até {transition:.2f}s.\n"
+            f"- Vídeo original de continuação: {transition:.2f}s até {info.duration:.2f}s."
+        )
+    else:
+        structure_line = f"- A nova mídia permanece durante os {info.duration:.2f}s do vídeo."
+
+    media_line = (
+        f"- Mídia inicial reconhecida automaticamente: **{media_word}**.\n"
+        "- O primeiro take foi normalizado separadamente antes da junção, garantindo que o vídeo original só apareça após a troca."
+    )
+    loop_line = ""
+    if intro_media.kind == "video":
+        source_duration = intro_media.duration or 0.0
+        if source_duration + 0.05 < intro_duration:
+            loop_line = (
+                f"\n- O vídeo inicial tinha {source_duration:.2f}s e foi repetido automaticamente "
+                f"para preencher {intro_duration:.2f}s."
+            )
+        elif source_duration > intro_duration + 0.05:
+            loop_line = (
+                f"\n- O vídeo inicial tinha {source_duration:.2f}s e foi cortado em "
+                f"{intro_duration:.2f}s para coincidir com a troca do take."
+            )
+
+    size_note = ""
+    if max(intro_media.original_width, intro_media.original_height) > max(output_w, output_h) + 1:
+        size_note = (
+            f"\n- Resolução otimizada: a mídia era {intro_media.original_width}×{intro_media.original_height}; "
+            f"a saída ficou {output_w}×{output_h}, preservando a proporção."
+        )
+    elif (intro_media.original_width, intro_media.original_height) != (output_w, output_h):
+        size_note = (
+            f"\n- Compatibilidade H.264: a mídia era {intro_media.original_width}×{intro_media.original_height}; "
+            f"a saída ficou {output_w}×{output_h} com dimensões pares."
+        )
+
+    transcript_line = ""
+    if transcript_summary:
+        transcript_line = f"\n\n**Transcrição identificada**\n{transcript_summary.strip()}"
+
+    report = (
+        "### Vídeo gerado\n"
+        f"- Saída: {final_info.width}×{final_info.height}, {final_info.fps:.2f} FPS, "
+        f"{final_info.duration:.2f}s.\n"
+        f"{media_line}\n"
+        f"{structure_line}\n"
+        f"- Áudio original: {'mantido do começo ao fim' if info.has_audio else 'o arquivo não possuía áudio'}."
+        f"{loop_line}{detection_line}{size_note}{transcript_line}"
+    )
+
+    _safe_progress(progress, 1.0, "Pronto.")
+    return ProcessResult(str(output_path), report, transition)
