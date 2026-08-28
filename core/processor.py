@@ -41,12 +41,17 @@ class ProcessResult:
 
 
 def cleanup_old_jobs() -> None:
+    """Apaga jobs, previews e imports antigos do diretório temporário."""
     cutoff = time.time() - TEMP_MAX_AGE_HOURS * 3600
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     for item in WORK_ROOT.iterdir():
         try:
-            if item.is_dir() and item.stat().st_mtime < cutoff:
+            if item.stat().st_mtime >= cutoff:
+                continue
+            if item.is_dir():
                 shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
         except OSError:
             continue
 
@@ -268,6 +273,37 @@ def _resolve_transition(
 
 
 
+def _caption_events_from_override(
+    rows: list[dict] | None,
+    text: str,
+    duration: float,
+) -> list[CaptionEvent]:
+    """Reconstrói eventos usando os tempos analisados e o texto revisado."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    valid_rows = []
+    for row in rows or []:
+        try:
+            start = max(0.0, float(row.get("start", 0.0)))
+            end = min(duration, float(row.get("end", duration)))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if end > start:
+            valid_rows.append((start, end))
+
+    if valid_rows and len(valid_rows) == len(lines):
+        return [CaptionEvent(start, end, line) for (start, end), line in zip(valid_rows, lines)]
+
+    # Se o usuário juntou/separou frases na revisão, distribui igualmente.
+    step = duration / max(len(lines), 1)
+    return [
+        CaptionEvent(index * step, min(duration, (index + 1) * step), line)
+        for index, line in enumerate(lines)
+    ]
+
+
 def process_video(
     *,
     photo_path: str,
@@ -280,6 +316,7 @@ def process_video(
     caption_font_percent: float,
     continuation_fit_mode: str,
     language: str,
+    caption_events_override: list[dict] | None = None,
     progress: ProgressFn | None = None,
 ) -> ProcessResult:
     """Gera o vídeo final. ``photo_path`` aceita imagem ou vídeo por compatibilidade de API."""
@@ -330,7 +367,12 @@ def process_video(
 
     caption_events: list[CaptionEvent] = []
     transcript_summary = ""
-    if caption_mode == "Transcrever o áudio automaticamente":
+    if caption_events_override is not None and caption_mode != "Sem legenda":
+        caption_events = _caption_events_from_override(
+            caption_events_override, manual_caption_text, intro_duration
+        )
+        transcript_summary = "Texto revisado pelo usuário antes da geração."
+    elif caption_mode == "Transcrever o áudio automaticamente":
         if not info.has_audio:
             raise MediaError("O vídeo original não possui áudio para transcrever. Use legenda manual ou sem legenda.")
         _safe_progress(progress, 0.30, "Transcrevendo o áudio do primeiro take...")

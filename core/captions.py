@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import functools
+import gc
 import re
 import shutil
 import subprocess
@@ -13,7 +14,19 @@ from typing import Iterable
 import regex
 from PIL import Image, ImageDraw, ImageFont
 
-from .config import CAPTION_FONT, DEFAULT_LANGUAGE, WHISPER_COMPUTE_TYPE, WHISPER_DEVICE, WHISPER_MODEL
+from .config import (
+    CAPTION_FONT,
+    DEFAULT_LANGUAGE,
+    OCR_CROP_BOTTOM_PERCENT,
+    OCR_CROP_SIDE_PERCENT,
+    OCR_CROP_TOP_PERCENT,
+    OCR_MAX_SAMPLES,
+    OCR_SAMPLE_STEP_SECONDS,
+    WHISPER_COMPUTE_TYPE,
+    WHISPER_DEVICE,
+    WHISPER_KEEP_MODEL_LOADED,
+    WHISPER_MODEL,
+)
 from .media import MediaError, require_binary, run_command
 
 
@@ -69,6 +82,17 @@ def _get_whisper_model():
                 ) from exc
             raise MediaError(f"Não foi possível carregar o modelo Whisper: {message}") from exc
         return _MODEL
+
+
+def _release_whisper_model() -> None:
+    """Libera o modelo da RAM em containers pequenos quando configurado."""
+    global _MODEL
+    if WHISPER_KEEP_MODEL_LOADED:
+        return
+    with _MODEL_LOCK:
+        _MODEL = None
+    gc.collect()
+
 
 
 def extract_audio_for_transcription(
@@ -147,6 +171,7 @@ def transcribe_intro(
     language: str | None = DEFAULT_LANGUAGE,
 ) -> tuple[list[CaptionEvent], str]:
     work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
     wav_path = work / "intro_audio.wav"
     extract_audio_for_transcription(video_path, wav_path, duration)
 
@@ -155,7 +180,7 @@ def transcribe_intro(
         segments, info = model.transcribe(
             str(wav_path),
             language=language or None,
-            beam_size=3,
+            beam_size=2,
             vad_filter=True,
             word_timestamps=True,
             condition_on_previous_text=False,
@@ -171,9 +196,15 @@ def transcribe_intro(
         detected_language = getattr(info, "language", None) or language or "desconhecido"
     except Exception as exc:
         raise MediaError(f"Falha durante a transcrição automática: {exc}") from exc
+    finally:
+        try:
+            wav_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        _release_whisper_model()
 
     clipped = [
-        CaptionEvent(event.start, min(event.end, duration), event.text)
+        CaptionEvent(event.start, min(event.end, duration), clean_review_text(event.text))
         for event in events
         if event.start < duration and event.end > 0
     ]
@@ -481,6 +512,50 @@ def render_caption_overlays(
     return overlays
 
 
+_COMMON_PT_ACCENTS = {
+    "voce": "você",
+    "voces": "vocês",
+    "nao": "não",
+    "tambem": "também",
+    "ninguem": "ninguém",
+    "alem": "além",
+    "porem": "porém",
+    "possivel": "possível",
+    "incrivel": "incrível",
+}
+
+
+def _preserve_case(replacement: str, original: str) -> str:
+    if original.isupper():
+        return replacement.upper()
+    if original[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+def clean_review_text(text: str) -> str:
+    """Limpeza conservadora de artefatos comuns de OCR/transcrição.
+
+    Corrige espaços/pontuação e alguns acentos muito inequívocos em português.
+    O resultado continua editável na interface antes de qualquer renderização.
+    """
+    value = (text or "").replace("\u00a0", " ").replace("|", "I")
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r" *\n *", "\n", value)
+    value = re.sub(r"\s+([,.;:!?])", r"\1", value)
+    value = re.sub(r"([,.;:!?])(?=[A-Za-zÀ-ÿ])", r"\1 ", value)
+    value = re.sub(r"([!?.,])\1{2,}", r"\1\1", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+
+    def fix_word(match):
+        original = match.group(0)
+        replacement = _COMMON_PT_ACCENTS.get(original.lower())
+        return _preserve_case(replacement, original) if replacement else original
+
+    value = re.sub(r"\b[A-Za-zÀ-ÿ]+\b", fix_word, value)
+    return value.strip()
+
+
 # ====================== LEITURA DA LEGENDA QUEIMADA (OCR) ======================
 
 _OCR_LANGUAGE_MAP = {"pt": "por", "en": "eng", "es": "spa"}
@@ -501,22 +576,34 @@ def _ocr_grab_frame(video_path: str | Path, time_sec: float):
 
 
 def _ocr_variants(frame):
-    """Prepara duas versões do quadro: cinza puro e 'texto branco isolado'.
-
-    Legendas de reels costumam ser texto branco com contorno preto. Isolar os
-    pixels quase brancos remove o fundo e melhora muito o reconhecimento.
-    """
+    """Recorta áreas de UI e cria duas versões leves para o Tesseract."""
     import cv2
     import numpy as np
 
     height, width = frame.shape[:2]
-    if width < 1000:
-        scale = 1000.0 / width
-        frame = cv2.resize(frame, (1000, int(round(height * scale))), interpolation=cv2.INTER_CUBIC)
+    top = int(height * OCR_CROP_TOP_PERCENT / 100.0)
+    bottom = int(height * (1.0 - OCR_CROP_BOTTOM_PERCENT / 100.0))
+    side = int(width * OCR_CROP_SIDE_PERCENT / 100.0)
+    right = max(side + 2, width - side)
+    bottom = max(top + 2, bottom)
+    frame = frame[top:bottom, side:right]
+
+    height, width = frame.shape[:2]
+    # OCR ganha muito pouco acima de ~900 px de largura e custa bem mais CPU.
+    target_width = 900
+    if width < target_width:
+        scale = target_width / max(width, 1)
+        frame = cv2.resize(frame, (target_width, int(round(height * scale))), interpolation=cv2.INTER_CUBIC)
+    elif width > 1200:
+        scale = 1200.0 / width
+        frame = cv2.resize(frame, (1200, int(round(height * scale))), interpolation=cv2.INTER_AREA)
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    white = (gray >= 200).astype(np.uint8) * 255
-    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # Texto claro, muito comum em Reels/TikTok.
+    white = (gray >= 195).astype(np.uint8) * 255
+    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))
     isolated = 255 - white
     return [gray, isolated]
 
@@ -534,7 +621,7 @@ def _ocr_frame(image, lang: str) -> tuple[str, float]:
             confidence = float(data["conf"][index])
         except (TypeError, ValueError):
             continue
-        if not token or confidence < 55:
+        if not token or confidence < 58:
             continue
         if not re.search(r"[\wÀ-ÿ]", token):
             continue
@@ -542,7 +629,7 @@ def _ocr_frame(image, lang: str) -> tuple[str, float]:
         lines.setdefault(key, []).append(token)
         confidences.append(confidence)
 
-    text = "\n".join(" ".join(words) for _key, words in sorted(lines.items())).strip()
+    text = clean_review_text("\n".join(" ".join(words) for _key, words in sorted(lines.items())).strip())
     average = sum(confidences) / len(confidences) if confidences else 0.0
     return text, average
 
@@ -631,10 +718,9 @@ def read_burned_caption(
     langs = [code for code in [preferred, "por", "eng"] if code and code in available]
     lang = "+".join(dict.fromkeys(langs)) or "eng"
 
-    # Amostragem adaptativa: ~1 quadro a cada 0.6s, piso de 5 e teto de 16
-    # amostras (um take de 3s fica com 5-6 amostras; um de 20s fica no teto).
-    step = 0.6
-    sample_count = max(5, min(16, int(duration / step) + 1))
+    # V2: menos amostras. O OCR era uma das partes mais caras do fluxo.
+    step = OCR_SAMPLE_STEP_SECONDS
+    sample_count = max(3, min(OCR_MAX_SAMPLES, int(duration / step) + 1))
     timestamps = [duration * (index + 0.5) / sample_count for index in range(sample_count)]
 
     per_frame: list[tuple[float, str, float]] = []
@@ -683,7 +769,7 @@ def read_burned_caption(
             continue
         start = max(0.0, min(card["start"], duration))
         end = max(start + 0.15, min(card["end"], duration))
-        events.append(CaptionEvent(start=start, end=end, text=best_text))
+        events.append(CaptionEvent(start=start, end=end, text=clean_review_text(best_text)))
         confidences.append(best_confidence)
 
     if not events:
@@ -692,7 +778,7 @@ def read_burned_caption(
     average = sum(confidences) / len(confidences)
     summary_text = "\n".join(event.text for event in events)
     summary = (
-        f"Legenda lida do vídeo original (confiança {average:.0f}%):\n{summary_text}\n"
-        "Emojis não são reconhecidos pelo OCR; se a original tiver emoji, use o texto fixo."
+        f"Texto detectado no vídeo (confiança aproximada {average:.0f}%):\n{summary_text}\n"
+        "Revise o texto antes de gerar. Emojis não são reconhecidos pelo OCR."
     )
     return events, summary
