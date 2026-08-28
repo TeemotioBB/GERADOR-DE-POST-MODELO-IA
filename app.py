@@ -432,6 +432,20 @@ with gr.Blocks(title=APP_NAME) as demo:
             lines=4,
             visible=True,
         )
+        with gr.Row():
+            caption_size = gr.Slider(
+                minimum=2.0,
+                maximum=12.0,
+                value=4.6,
+                step=0.1,
+                label="Tamanho do texto no primeiro take",
+                info="Ajuste aqui e clique em Pré-visualizar para conferir antes de gerar.",
+            )
+            caption_position = gr.Dropdown(
+                choices=["Centro", "Centro inferior", "Centro superior"],
+                value="Centro",
+                label="Posição do texto",
+            )
 
     with gr.Group(elem_classes=["step-card"]):
         gr.HTML('<div class="step-title">3. Nova mídia e prévia</div><div class="step-help">A prévia é uma imagem rápida e não gasta uma renderização completa.</div>')
@@ -470,19 +484,6 @@ with gr.Blocks(title=APP_NAME) as demo:
             value="Manter inteiro com fundo desfocado",
             label="Encaixe da continuação",
         )
-        with gr.Row():
-            caption_position = gr.Dropdown(
-                choices=["Centro", "Centro inferior", "Centro superior"],
-                value="Centro",
-                label="Posição da legenda",
-            )
-            caption_size = gr.Slider(
-                minimum=2.5,
-                maximum=8.0,
-                value=4.6,
-                step=0.1,
-                label="Tamanho da fonte",
-            )
         language = gr.Dropdown(
             choices=["Português", "Detectar automaticamente", "Inglês", "Espanhol"],
             value="Português",
