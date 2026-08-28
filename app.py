@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import uuid
-import json
 from pathlib import Path
 
+import cv2
 import gradio as gr
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
+from PIL import Image, ImageOps, UnidentifiedImageError
 
-from core.config import APP_NAME, WORK_ROOT
+from core.captions import CaptionEvent, read_burned_caption, render_caption_overlays, transcribe_intro
+from core.config import APP_NAME, MAX_INSTAGRAM_DOWNLOAD_MB, WORK_ROOT
 from core.media import MediaError, probe_video
 from core.processor import cleanup_old_jobs, process_video
 from core.transition import detect_intro_end
@@ -20,63 +23,121 @@ import url_import
 cleanup_old_jobs()
 
 CSS = """
-.gradio-container {max-width: 1180px !important;}
-.hero {padding: 18px 20px; border: 1px solid var(--border-color-primary); border-radius: 18px;}
-.hero h1 {margin-bottom: 6px !important;}
-.small-note {font-size: 0.92rem; opacity: 0.82;}
-#generate-btn {min-height: 48px; font-weight: 700;}
+.gradio-container {max-width: 1120px !important; margin: 0 auto !important;}
+.hero-v2 {
+  padding: 22px 24px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: 20px;
+  margin-bottom: 14px;
+}
+.hero-v2 h1 {margin: 0 0 6px 0 !important; font-size: 1.8rem !important;}
+.hero-v2 p {margin: 0 !important; opacity: .78;}
+.step-card {
+  border: 1px solid var(--border-color-primary) !important;
+  border-radius: 18px !important;
+  padding: 14px !important;
+  margin-bottom: 12px !important;
+}
+.step-title {font-size: 1.02rem; font-weight: 700; margin-bottom: 2px;}
+.step-help {font-size: .9rem; opacity: .72; margin-bottom: 8px;}
+#analyze-btn, #preview-btn, #generate-btn {min-height: 48px; font-weight: 700;}
+#generate-btn {font-size: 1.03rem;}
+.status-ok {padding: 10px 12px; border-radius: 12px;}
+.small-note {font-size: .88rem; opacity: .75; line-height: 1.45;}
+.result-card {margin-top: 10px;}
+@media (max-width: 700px) {
+  .hero-v2 {padding: 18px 16px;}
+  .step-card {padding: 10px !important;}
+}
 """
 
-# Cache de vídeos importados por URL (para evitar re-análise)
-IMPORTED_VIDEOS = {}
-
-# Nome de pasta de job é sempre um uuid4().hex (32 chars hexadecimais) — ver
-# `job_dir = WORK_ROOT / uuid.uuid4().hex` em core/processor.py.
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
-def _job_video_link_html(output_path: str) -> str:
-    """Monta um link direto para o vídeo pronto (fora do player do Gradio).
+def _language_code(label: str) -> str:
+    return {
+        "Português": "pt",
+        "Detectar automaticamente": "",
+        "Inglês": "en",
+        "Espanhol": "es",
+    }.get(label, "pt")
 
-    No iPhone, o botão de download do próprio Gradio costuma salvar em
-    Arquivos, não na Galeria/Fotos — e em alguns iOS o preview embutido do
-    Gradio simplesmente não carrega. Abrindo o vídeo direto numa aba do
-    Safari, o player nativo assume e o menu Compartilhar ganha a opção
-    "Salvar Vídeo", que salva direto na Galeria.
-    """
+
+def _video_player_html(output_path: str) -> str:
     job_id = Path(output_path).parent.name
     if not _JOB_ID_RE.match(job_id):
         return ""
-    return (
-        "<div class='small-note' style='margin-top:8px; line-height:1.5;'>"
-        f"<a href='/midia/{job_id}.mp4' target='_blank' rel='noopener'>"
-        "🔗 Abrir vídeo em uma aba (recomendado no celular)</a><br>"
-        "<b>No iPhone:</b> toque no link acima, espere o vídeo abrir em tela cheia, toque no ícone de "
-        "Compartilhar (o quadrado com a seta) e escolha <b>“Salvar Vídeo”</b> — assim ele vai direto "
-        "para a Galeria/Fotos."
-        "</div>"
-    )
+    url = f"/midia/{job_id}.mp4"
+    return f"""
+    <div style="margin-top:10px">
+      <video controls playsinline preload="metadata" style="width:100%;max-height:680px;border-radius:14px;background:#000" src="{url}"></video>
+      <div class="small-note" style="margin-top:8px">
+        Se o player acima não abrir no seu celular, <a href="{url}" target="_blank" rel="noopener"><b>abra o vídeo em uma nova aba</b></a>.
+      </div>
+    </div>
+    """
+
+
+def video_input_visibility(choice: str):
+    local = choice == "Enviar arquivo"
+    return gr.update(visible=local), gr.update(visible=not local)
 
 
 def transition_visibility(choice: str):
     return gr.update(visible=choice == "Informar o segundo manualmente")
 
 
-def caption_visibility(choice: str):
-    return gr.update(visible=choice == "Usar um texto fixo")
+def caption_review_visibility(choice: str):
+    return gr.update(visible=choice != "Sem legenda")
 
 
-def video_input_visibility(choice: str):
-    """Mostra/esconde os campos de upload/URL baseado na escolha."""
-    if choice == "Carregar arquivo local":
-        return gr.update(visible=True), gr.update(visible=False)
-    else:  # "Importar por URL"
-        return gr.update(visible=False), gr.update(visible=True)
+def importar_video_url(url: str) -> str:
+    if not (url or "").strip():
+        raise gr.Error("Cole um link válido.")
+    cleanup_old_jobs()
+    job_id = uuid.uuid4().hex
+    try:
+        caminho, _nome = url_import.baixar_video(
+            url=url.strip(),
+            pasta_destino=str(WORK_ROOT),
+            identificador=job_id,
+            limite_mb=MAX_INSTAGRAM_DOWNLOAD_MB,
+        )
+        return caminho
+    except url_import.VideoImportError as exc:
+        raise gr.Error(str(exc)) from exc
+    except Exception as exc:
+        raise gr.Error(f"Falha ao importar o vídeo: {exc}") from exc
 
 
-def analyze_video(video_path: str | None):
+def handle_url_import(url: str):
+    caminho = importar_video_url(url)
+    info = probe_video(caminho)
+    status = f"✅ Vídeo importado • {info.duration:.1f}s • {info.width}×{info.height}"
+    return status, caminho
+
+
+def handle_local_video(path: str | None):
+    if not path:
+        return "", None
+    try:
+        info = probe_video(path)
+        return f"✅ Vídeo carregado • {info.duration:.1f}s • {info.width}×{info.height}", path
+    except MediaError as exc:
+        raise gr.Error(str(exc)) from exc
+
+
+def _analysis_work_dir() -> Path:
+    path = WORK_ROOT / f"analysis_{uuid.uuid4().hex}"
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def analyze_source(video_path: str | None, caption_source: str, language_label: str):
     if not video_path:
-        raise gr.Error("Envie o vídeo original primeiro.")
+        raise gr.Error("Adicione o vídeo original primeiro.")
+
+    cleanup_old_jobs()
     try:
         info = probe_video(video_path)
         detected = detect_intro_end(video_path)
@@ -84,334 +145,419 @@ def analyze_video(video_path: str | None):
         raise gr.Error(str(exc)) from exc
 
     if detected.seconds is None:
-        text = (
-            "### Análise do vídeo original\n"
-            f"- Duração: {info.duration:.2f}s\n"
-            f"- Tamanho original: {info.width}×{info.height}\n"
-            f"- FPS: {info.fps:.2f}\n"
-            f"- Áudio: {'sim' if info.has_audio else 'não'}\n"
-            f"- Resultado: {detected.message}\n\n"
-            "Você pode escolher **Sem vídeo de continuação** ou informar o segundo manualmente."
-        )
-        return text, None
+        transition = info.duration
+        has_continuation = False
+        transition_mode = "Sem vídeo de continuação"
+        transition_message = "Nenhuma troca segura foi encontrada; o primeiro take será mantido até o final."
+    else:
+        transition = min(max(float(detected.seconds), 0.1), info.duration - 0.05)
+        has_continuation = True
+        transition_mode = "Informar o segundo manualmente"
+        transition_message = f"Troca detectada em {transition:.2f}s ({detected.confidence:.0%} de confiança)."
 
-    text = (
-        "### Análise do vídeo original\n"
-        f"- Duração: {info.duration:.2f}s\n"
-        f"- Tamanho original: {info.width}×{info.height}\n"
-        f"- FPS: {info.fps:.2f}\n"
-        f"- Áudio: {'sim' if info.has_audio else 'não'}\n"
-        f"- Troca provável do take: **{detected.seconds:.2f}s**\n"
-        f"- Confiança aproximada: {detected.confidence:.0%}\n\n"
-        "A geração automática usará esse ponto. Se estiver errado, selecione o modo manual."
+    intro_duration = transition if has_continuation else info.duration
+    language = _language_code(language_label)
+    events: list[CaptionEvent] = []
+    summary = ""
+
+    if caption_source == "Copiar texto escrito no vídeo":
+        try:
+            events, summary = read_burned_caption(
+                video_path,
+                intro_duration,
+                language=language or "pt",
+            )
+        except MediaError as exc:
+            raise gr.Error(str(exc)) from exc
+    elif caption_source == "Transcrever o áudio":
+        if not info.has_audio:
+            raise gr.Error("O vídeo não possui áudio para transcrever.")
+        work_dir = _analysis_work_dir()
+        try:
+            events, summary = transcribe_intro(
+                video_path,
+                work_dir,
+                intro_duration,
+                language=language or None,
+            )
+        except MediaError as exc:
+            raise gr.Error(str(exc)) from exc
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+    elif caption_source in {"Digitar manualmente", "Sem legenda"}:
+        events = []
+    else:
+        raise gr.Error("Escolha uma opção de legenda válida.")
+
+    text = "\n".join(event.text.strip() for event in events if event.text.strip()).strip()
+    timings = [{"start": event.start, "end": event.end} for event in events]
+
+    if caption_source == "Copiar texto escrito no vídeo" and not text:
+        caption_note = "⚠️ Não consegui ler texto com confiança. Você pode digitar/corrigir manualmente no campo abaixo."
+    elif caption_source == "Transcrever o áudio" and not text:
+        caption_note = "⚠️ Não encontrei fala clara. Você pode digitar o texto manualmente."
+    elif caption_source == "Sem legenda":
+        caption_note = "Sem legenda selecionada."
+    elif caption_source == "Digitar manualmente":
+        caption_note = "Digite o texto que deseja usar antes de pré-visualizar."
+    else:
+        caption_note = "✅ Texto detectado. Revise antes de gerar — você pode editar qualquer palavra."
+
+    state = {
+        "video_path": video_path,
+        "duration": info.duration,
+        "transition": transition,
+        "has_continuation": has_continuation,
+        "caption_source": caption_source,
+    }
+
+    details = f"### Análise concluída\n**{transition_message}**\n\n{caption_note}"
+    if summary and caption_source in {"Copiar texto escrito no vídeo", "Transcrever o áudio"}:
+        # O texto já aparece no campo editável; aqui mostramos só informação curta.
+        first_line = summary.splitlines()[0] if summary.splitlines() else ""
+        if first_line:
+            details += f"\n\n<span style='opacity:.72'>{first_line}</span>"
+
+    return (
+        details,
+        gr.update(value=text, visible=caption_source != "Sem legenda"),
+        timings,
+        state,
+        gr.update(value=transition_mode),
+        gr.update(value=transition if has_continuation else None, visible=has_continuation),
     )
-    return text, detected.seconds
 
 
-def importar_video_url(url: str):
-    """Importa vídeo por URL e retorna o caminho local."""
-    if not url or not url.strip():
-        raise gr.Error("Cole um link válido.")
-    
-    job_id = uuid.uuid4().hex
+def _load_preview_base(path: str) -> Image.Image:
+    source = Path(path)
     try:
-        caminho, nome = url_import.baixar_video(
-            url=url,
-            pasta_destino=str(WORK_ROOT),
-            identificador=job_id,
-            limite_mb=500,  # Ajuste conforme seu limite
+        with Image.open(source) as image:
+            return ImageOps.exif_transpose(image).convert("RGB")
+    except (UnidentifiedImageError, OSError, ValueError):
+        pass
+
+    cap = cv2.VideoCapture(str(source))
+    if not cap.isOpened():
+        raise MediaError("Não foi possível abrir a nova mídia para pré-visualização.")
+    try:
+        ok, frame = cap.read()
+        if not ok:
+            raise MediaError("Não foi possível ler o primeiro quadro da nova mídia.")
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(frame)
+    finally:
+        cap.release()
+
+
+def preview_image(
+    intro_media_path: str | None,
+    reviewed_text: str,
+    caption_source: str,
+    caption_position: str,
+    caption_size: float,
+):
+    if not intro_media_path:
+        raise gr.Error("Envie a nova foto ou vídeo antes de pré-visualizar.")
+
+    try:
+        base = _load_preview_base(intro_media_path)
+    except MediaError as exc:
+        raise gr.Error(str(exc)) from exc
+
+    max_edge = 720
+    if max(base.size) > max_edge:
+        ratio = max_edge / max(base.size)
+        base = base.resize(
+            (max(2, int(base.width * ratio)), max(2, int(base.height * ratio))),
+            Image.Resampling.LANCZOS,
         )
-        IMPORTED_VIDEOS[job_id] = {"path": caminho, "nome": nome}
-        return caminho
-    except url_import.VideoImportError as e:
-        raise gr.Error(str(e)) from e
-    except Exception as e:
-        raise gr.Error(f"Falha ao importar: {e}") from e
+
+    preview_dir = WORK_ROOT / f"preview_{uuid.uuid4().hex}"
+    preview_dir.mkdir(parents=True, exist_ok=False)
+    output_path = preview_dir / "preview.png"
+
+    try:
+        final = base.convert("RGBA")
+        if caption_source != "Sem legenda" and (reviewed_text or "").strip():
+            # A prévia mostra a primeira frase/cartão, sem renderizar um MP4 inteiro.
+            first_text = next((line.strip() for line in reviewed_text.splitlines() if line.strip()), "")
+            overlays = render_caption_overlays(
+                [CaptionEvent(0.0, 1.0, first_text)],
+                preview_dir,
+                width=final.width,
+                height=final.height,
+                font_percent=float(caption_size),
+                position=caption_position,
+            )
+            if overlays:
+                with Image.open(overlays[0].path) as overlay:
+                    final = Image.alpha_composite(final, overlay.convert("RGBA"))
+        final.convert("RGB").save(output_path, format="PNG", optimize=True)
+    except Exception as exc:
+        shutil.rmtree(preview_dir, ignore_errors=True)
+        raise gr.Error(f"Não foi possível criar a prévia: {exc}") from exc
+
+    return str(output_path), "Prévia rápida criada. O vídeo final mantém o áudio e a continuação."
 
 
-def generate_video(
+def generate_final(
     intro_media_path: str | None,
     video_path: str | None,
+    analysis_state: dict | None,
+    caption_timings: list | None,
+    reviewed_text: str,
+    caption_source: str,
     transition_mode: str,
     manual_transition_seconds: float | None,
-    caption_mode: str,
-    manual_caption_text: str,
+    continuation_fit_mode: str,
     caption_position: str,
     caption_font_percent: float,
-    continuation_fit_mode: str,
     language_label: str,
     progress=gr.Progress(),
 ):
-    language_map = {
-        "Português": "pt",
-        "Detectar automaticamente": "",
-        "Inglês": "en",
-        "Espanhol": "es",
-    }
+    if not intro_media_path:
+        raise gr.Error("Envie a nova foto ou vídeo.")
+    if not video_path:
+        raise gr.Error("Adicione o vídeo original.")
+    if not analysis_state or analysis_state.get("video_path") != video_path:
+        raise gr.Error("Clique em 'Analisar vídeo' antes de gerar. Isso evita processamento duplicado.")
+    if analysis_state.get("caption_source") != caption_source:
+        raise gr.Error("Você mudou o modo de legenda. Clique em 'Analisar vídeo' novamente.")
+
+    if caption_source != "Sem legenda" and not (reviewed_text or "").strip():
+        raise gr.Error("Revise ou digite o texto da legenda antes de gerar.")
+
+    language = _language_code(language_label)
+    # A análise já calculou a transição. No modo automático da tela, reutilizamos
+    # o segundo detectado para não analisar o mesmo vídeo duas vezes.
+    if transition_mode == "Detectar automaticamente":
+        if analysis_state.get("has_continuation"):
+            effective_transition_mode = "Informar o segundo manualmente"
+            effective_manual = float(analysis_state["transition"])
+        else:
+            effective_transition_mode = "Sem vídeo de continuação"
+            effective_manual = None
+    else:
+        effective_transition_mode = transition_mode
+        effective_manual = manual_transition_seconds
+
+    if caption_source == "Sem legenda":
+        processor_caption_mode = "Sem legenda"
+        override = None
+    else:
+        # O texto já foi analisado e revisado. Não rodamos OCR/Whisper novamente.
+        processor_caption_mode = "Usar um texto fixo"
+        override = list(caption_timings or [])
 
     try:
         result = process_video(
-            photo_path=intro_media_path or "",
-            video_path=video_path or "",
-            transition_mode=transition_mode,
-            manual_transition_seconds=manual_transition_seconds,
-            caption_mode=caption_mode,
-            manual_caption_text=manual_caption_text or "",
+            photo_path=intro_media_path,
+            video_path=video_path,
+            transition_mode=effective_transition_mode,
+            manual_transition_seconds=effective_manual,
+            caption_mode=processor_caption_mode,
+            manual_caption_text=reviewed_text or "",
             caption_position=caption_position,
             caption_font_percent=float(caption_font_percent),
             continuation_fit_mode=continuation_fit_mode,
-            language=language_map.get(language_label, "pt"),
+            language=language,
+            caption_events_override=override,
             progress=lambda value, description: progress(value, desc=description),
         )
     except MediaError as exc:
         raise gr.Error(str(exc)) from exc
     except Exception as exc:
-        raise gr.Error(f"Erro inesperado: {exc}") from exc
+        raise gr.Error(f"Erro inesperado durante a geração: {exc}") from exc
 
-    return (
-        result.output_path,
-        result.report,
-        result.transition_seconds,
-        _job_video_link_html(result.output_path),
-    )
+    return result.output_path, result.report, _video_player_html(result.output_path)
 
 
 with gr.Blocks(title=APP_NAME) as demo:
-    gr.Markdown(
+    gr.HTML(
         """
-        <div class="hero">
-          <h1>Mídia + Vídeo Automático</h1>
-          <p>Use uma foto ou um vídeo no primeiro take, recrie a legenda com emojis, mantenha o áudio original e preserve o vídeo de continuação.</p>
+        <div class="hero-v2">
+          <h1>🎬 Mídia + Vídeo Automático</h1>
+          <p>Importe o original, revise o texto, veja uma prévia rápida e só então renderize o vídeo final.</p>
         </div>
         """
     )
 
-    with gr.Row(equal_height=False):
-        with gr.Column(scale=1):
-            intro_media = gr.File(
-                label="1. Nova mídia da personagem (foto ou vídeo)",
-                file_types=["image", "video"],
-                type="filepath",
-            )
-            
-            # === NOVA SEÇÃO: Escolher entre upload local ou URL ===
-            video_input_mode = gr.Radio(
-                choices=[
-                    "Carregar arquivo local",
-                    "Importar por URL",
-                ],
-                value="Carregar arquivo local",
-                label="Como adicionar o vídeo original?",
-            )
-            
-            # Arquivo local
-            video_upload = gr.File(
-                label="2. Vídeo original com áudio e possível continuação",
-                file_types=["video"],
-                type="filepath",
-                visible=True,
-            )
-            
-            # URL
-            with gr.Group(visible=False) as video_url_group:
-                gr.Markdown("**Cole o link do vídeo** (Instagram, TikTok, YouTube, Twitter/X, etc.)")
+    video_path_state = gr.State(value=None)
+    analysis_state = gr.State(value=None)
+    caption_timings_state = gr.State(value=[])
+
+    with gr.Group(elem_classes=["step-card"]):
+        gr.HTML('<div class="step-title">1. Vídeo original</div><div class="step-help">Envie o arquivo ou cole o link do Reel/vídeo.</div>')
+        input_mode = gr.Radio(
+            choices=["Enviar arquivo", "Importar por URL"],
+            value="Importar por URL",
+            label="Origem",
+        )
+        local_video = gr.File(
+            label="Vídeo original",
+            file_types=["video"],
+            type="filepath",
+            visible=False,
+        )
+        with gr.Group(visible=True) as url_group:
+            with gr.Row():
                 video_url = gr.Textbox(
-                    label="URL do vídeo",
+                    label="Link do vídeo",
                     placeholder="https://www.instagram.com/reel/...",
-                    lines=2,
+                    scale=4,
                 )
-                import_button = gr.Button("📥 Importar vídeo", variant="secondary")
-                import_status = gr.Markdown(visible=False)
-            
-            # Armazena o caminho do vídeo (local ou importado)
-            video_path_state = gr.State(value=None)
-            
-            gr.Markdown(
-                "A proporção final segue a primeira mídia. Se ela for um vídeo curto, ele será repetido até a troca do take; se for longo, será cortado no ponto da troca.",
-                elem_classes=["small-note"],
-            )
+                import_button = gr.Button("📥 Importar", variant="secondary", scale=1)
+        import_status = gr.Markdown()
 
-            analyze_button = gr.Button("Analisar troca do take", variant="secondary")
-            analysis_result = gr.Markdown()
-            gr.Markdown(
-                "**Dica**: se aparecer um pedacinho da modelo original no resultado, use o modo "
-                "manual e informe o segundo exato da troca (o botão acima mostra o segundo detectado).",
-                elem_classes=["small-note"],
-            )
+    with gr.Group(elem_classes=["step-card"]):
+        gr.HTML('<div class="step-title">2. Analisar conteúdo</div><div class="step-help">Detecta a troca do take e extrai o texto uma única vez.</div>')
+        caption_source = gr.Radio(
+            choices=[
+                "Copiar texto escrito no vídeo",
+                "Transcrever o áudio",
+                "Digitar manualmente",
+                "Sem legenda",
+            ],
+            value="Copiar texto escrito no vídeo",
+            label="Como obter a legenda?",
+        )
+        analyze_button = gr.Button("🔎 ANALISAR VÍDEO", variant="primary", elem_id="analyze-btn")
+        analysis_result = gr.Markdown()
+        reviewed_text = gr.Textbox(
+            label="Texto detectado — revise antes de gerar",
+            placeholder="O texto aparecerá aqui. Você pode corrigir qualquer palavra ou digitar manualmente.",
+            lines=4,
+            visible=True,
+        )
 
-        with gr.Column(scale=1):
-            transition_mode = gr.Radio(
+    with gr.Group(elem_classes=["step-card"]):
+        gr.HTML('<div class="step-title">3. Nova mídia e prévia</div><div class="step-help">A prévia é uma imagem rápida e não gasta uma renderização completa.</div>')
+        intro_media = gr.File(
+            label="Nova foto ou vídeo do primeiro take",
+            file_types=["image", "video"],
+            type="filepath",
+        )
+        preview_button = gr.Button("👁️ PRÉ-VISUALIZAR", variant="secondary", elem_id="preview-btn")
+        with gr.Row(equal_height=False):
+            preview_output = gr.Image(label="Prévia", interactive=False)
+            preview_status = gr.Markdown()
+
+    with gr.Accordion("⚙️ Configurações avançadas", open=False):
+        with gr.Row():
+            transition_mode = gr.Dropdown(
                 choices=[
                     "Detectar automaticamente",
                     "Informar o segundo manualmente",
                     "Sem vídeo de continuação",
                 ],
                 value="Detectar automaticamente",
-                label="Onde termina o primeiro take?",
+                label="Troca do primeiro take",
             )
             manual_transition = gr.Number(
-                label="Segundo em que começa o vídeo de continuação",
-                value=5.0,
+                label="Segundo da troca",
                 minimum=0.01,
                 visible=False,
             )
-
-            continuation_fit = gr.Radio(
-                choices=[
-                    "Manter inteiro com fundo desfocado",
-                    "Barras pretas",
-                    "Preencher a tela (pode cortar bordas)",
-                ],
-                value="Manter inteiro com fundo desfocado",
-                label="Como encaixar a continuação no tamanho da primeira mídia?",
-            )
-
-            caption_mode = gr.Radio(
-                choices=[
-                    "Transcrever o áudio automaticamente",
-                    "Copiar o texto escrito no vídeo original",
-                    "Usar um texto fixo",
-                    "Sem legenda",
-                ],
-                value="Transcrever o áudio automaticamente",
-                label="Legenda do primeiro take",
-            )
-            manual_caption = gr.Textbox(
-                label="Texto da legenda (emojis permitidos 😍🔥✨)",
-                placeholder="Digite a frase com texto e emojis...",
-                lines=3,
-                visible=False,
-            )
-
-            with gr.Row():
-                caption_position = gr.Dropdown(
-                    choices=["Centro", "Centro inferior", "Centro superior"],
-                    value="Centro",
-                    label="Posição",
-                )
-                caption_size = gr.Slider(
-                    minimum=2.5,
-                    maximum=8.0,
-                    value=4.6,
-                    step=0.1,
-                    label="Tamanho da fonte (% da altura)",
-                )
-
-            language = gr.Dropdown(
-                choices=["Português", "Detectar automaticamente", "Inglês", "Espanhol"],
-                value="Português",
-                label="Idioma da transcrição",
-            )
-
-    generate_button = gr.Button("GERAR VÍDEO", variant="primary", elem_id="generate-btn")
-
-    with gr.Row(equal_height=False):
-        output_video = gr.Video(label="Vídeo pronto")
-        with gr.Column():
-            report = gr.Markdown()
-            transition_used = gr.Number(label="Segundo da transição usado", interactive=False)
-            save_link = gr.HTML()
-
-    # === LÓGICA DE EVENTOS ===
-    
-    # Ao mudar modo de entrada, mostra/esconde campos
-    video_input_mode.change(
-        fn=video_input_visibility,
-        inputs=video_input_mode,
-        outputs=[video_upload, video_url_group],
-    )
-    
-    # Quando arquivo local é selecionado, armazena no state
-    video_upload.change(
-        fn=lambda x: x,
-        inputs=video_upload,
-        outputs=video_path_state,
-    )
-    
-    # Quando URL é importada
-    def handle_url_import(url):
-        caminho = importar_video_url(url)
-        return (
-            gr.update(value="✅ Vídeo importado com sucesso!", visible=True),
-            caminho,
+        continuation_fit = gr.Dropdown(
+            choices=[
+                "Manter inteiro com fundo desfocado",
+                "Barras pretas",
+                "Preencher a tela (pode cortar bordas)",
+            ],
+            value="Manter inteiro com fundo desfocado",
+            label="Encaixe da continuação",
         )
-    
+        with gr.Row():
+            caption_position = gr.Dropdown(
+                choices=["Centro", "Centro inferior", "Centro superior"],
+                value="Centro",
+                label="Posição da legenda",
+            )
+            caption_size = gr.Slider(
+                minimum=2.5,
+                maximum=8.0,
+                value=4.6,
+                step=0.1,
+                label="Tamanho da fonte",
+            )
+        language = gr.Dropdown(
+            choices=["Português", "Detectar automaticamente", "Inglês", "Espanhol"],
+            value="Português",
+            label="Idioma",
+        )
+
+    generate_button = gr.Button("✨ GERAR VÍDEO FINAL", variant="primary", elem_id="generate-btn")
+
+    with gr.Group(elem_classes=["step-card", "result-card"]):
+        gr.HTML('<div class="step-title">Resultado</div>')
+        output_video = gr.Video(label="Vídeo pronto", format="mp4", interactive=False)
+        fallback_player = gr.HTML()
+        report = gr.Markdown()
+
+    input_mode.change(
+        fn=video_input_visibility,
+        inputs=input_mode,
+        outputs=[local_video, url_group],
+    )
+    local_video.change(
+        fn=handle_local_video,
+        inputs=local_video,
+        outputs=[import_status, video_path_state],
+    )
     import_button.click(
         fn=handle_url_import,
         inputs=video_url,
         outputs=[import_status, video_path_state],
     )
-    
-    # Análise do vídeo
-    def analyze_wrapper(video_path):
-        return analyze_video(video_path)
-
-    analyze_button.click(
-        fn=analyze_wrapper,
-        inputs=video_path_state,
-        outputs=[analysis_result, manual_transition],
+    caption_source.change(
+        fn=caption_review_visibility,
+        inputs=caption_source,
+        outputs=reviewed_text,
     )
-
-    # Geração
-    def generate_wrapper(
-        intro_media_path,
-        video_path,
-        transition_mode,
-        manual_transition_seconds,
-        caption_mode,
-        manual_caption_text,
-        caption_position,
-        caption_font_percent,
-        continuation_fit_mode,
-        language_label,
-        progress=gr.Progress(),
-    ):
-        return generate_video(
-            intro_media_path,
-            video_path,
-            transition_mode,
-            manual_transition_seconds,
-            caption_mode,
-            manual_caption_text,
-            caption_position,
-            caption_font_percent,
-            continuation_fit_mode,
-            language_label,
-            progress,
-        )
-
-    generate_button.click(
-        fn=generate_wrapper,
-        inputs=[
-            intro_media,
-            video_path_state,
-            transition_mode,
-            manual_transition,
-            caption_mode,
-            manual_caption,
-            caption_position,
-            caption_size,
-            continuation_fit,
-            language,
-        ],
-        outputs=[output_video, report, transition_used, save_link],
-        api_name="generate",
-    )
-
-    # Outros eventos
     transition_mode.change(
         fn=transition_visibility,
         inputs=transition_mode,
         outputs=manual_transition,
     )
-    caption_mode.change(
-        fn=caption_visibility,
-        inputs=caption_mode,
-        outputs=manual_caption,
+    analyze_button.click(
+        fn=analyze_source,
+        inputs=[video_path_state, caption_source, language],
+        outputs=[
+            analysis_result,
+            reviewed_text,
+            caption_timings_state,
+            analysis_state,
+            transition_mode,
+            manual_transition,
+        ],
+    )
+    preview_button.click(
+        fn=preview_image,
+        inputs=[intro_media, reviewed_text, caption_source, caption_position, caption_size],
+        outputs=[preview_output, preview_status],
+    )
+    generate_button.click(
+        fn=generate_final,
+        inputs=[
+            intro_media,
+            video_path_state,
+            analysis_state,
+            caption_timings_state,
+            reviewed_text,
+            caption_source,
+            transition_mode,
+            manual_transition,
+            continuation_fit,
+            caption_position,
+            caption_size,
+            language,
+        ],
+        outputs=[output_video, report, fallback_player],
+        api_name="generate",
     )
 
 
-demo.queue(max_size=8, default_concurrency_limit=1)
+demo.queue(max_size=4, default_concurrency_limit=1)
 
 fastapi_app = FastAPI(title=APP_NAME)
 
@@ -423,12 +569,6 @@ def health():
 
 @fastapi_app.get("/midia/{job_id}.mp4")
 def get_job_video(job_id: str):
-    """Serve o vídeo pronto direto (fora do player do Gradio).
-
-    Abrir essa URL diretamente no Safari faz o iOS tratar o conteúdo com o
-    player nativo (em vez de um download de arquivo genérico), habilitando
-    'Salvar Vídeo' no menu Compartilhar — que manda direto pra Galeria.
-    """
     if not _JOB_ID_RE.match(job_id):
         return JSONResponse({"erro": "identificador inválido"}, status_code=400)
 
@@ -436,11 +576,11 @@ def get_job_video(job_id: str):
     try:
         path.relative_to(Path(WORK_ROOT).resolve())
     except ValueError:
-        return JSONResponse({"erro": "identificador inválido"}, status_code=400)
+        return JSONResponse({"erro": "caminho inválido"}, status_code=400)
 
     if not path.exists():
         return JSONResponse(
-            {"erro": "Vídeo não encontrado. Ele pode ter expirado (limpeza automática) ou o link está errado."},
+            {"erro": "Vídeo não encontrado ou já removido pela limpeza automática."},
             status_code=404,
         )
 
@@ -456,35 +596,23 @@ def get_job_video(job_id: str):
 def api_info():
     return {
         "name": APP_NAME,
-        "work_root": str(WORK_ROOT),
         "status": "online",
-        "intro_media": ["image", "video"],
-        "emoji_captions": True,
+        "preview": True,
+        "review_before_render": True,
         "url_import": True,
     }
 
 
 @fastapi_app.post("/api/import-video")
 def api_import_video(data: dict):
-    """API para importar vídeo por URL (para integração com outros apps)."""
     url = (data.get("url") or "").strip()
     if not url:
-        return {"erro": "URL não fornecida"}, 400
-    
-    job_id = uuid.uuid4().hex
+        return JSONResponse({"erro": "URL não fornecida"}, status_code=400)
     try:
-        caminho, nome = url_import.baixar_video(
-            url=url,
-            pasta_destino=str(WORK_ROOT),
-            identificador=job_id,
-            limite_mb=500,
-        )
-        IMPORTED_VIDEOS[job_id] = {"path": caminho, "nome": nome}
-        return {"id": job_id, "caminho": caminho, "nome": nome}
-    except url_import.VideoImportError as e:
-        return {"erro": str(e)}, 400
-    except Exception as e:
-        return {"erro": f"Falha ao importar: {e}"}, 500
+        caminho = importar_video_url(url)
+        return {"caminho": caminho}
+    except gr.Error as exc:
+        return JSONResponse({"erro": str(exc)}, status_code=400)
 
 
 username = os.getenv("APP_USERNAME", "").strip()
