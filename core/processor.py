@@ -278,30 +278,12 @@ def _caption_events_from_override(
     text: str,
     duration: float,
 ) -> list[CaptionEvent]:
-    """Reconstrói eventos usando os tempos analisados e o texto revisado."""
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    if not lines:
+    """A legenda revisada é SEMPRE única e fixa durante todo o primeiro take."""
+    del rows  # tempos antigos não são mais usados para legenda fixa
+    cleaned = (text or "").strip()
+    if not cleaned:
         return []
-
-    valid_rows = []
-    for row in rows or []:
-        try:
-            start = max(0.0, float(row.get("start", 0.0)))
-            end = min(duration, float(row.get("end", duration)))
-        except (TypeError, ValueError, AttributeError):
-            continue
-        if end > start:
-            valid_rows.append((start, end))
-
-    if valid_rows and len(valid_rows) == len(lines):
-        return [CaptionEvent(start, end, line) for (start, end), line in zip(valid_rows, lines)]
-
-    # Se o usuário juntou/separou frases na revisão, distribui igualmente.
-    step = duration / max(len(lines), 1)
-    return [
-        CaptionEvent(index * step, min(duration, (index + 1) * step), line)
-        for index, line in enumerate(lines)
-    ]
+    return [CaptionEvent(0.0, max(0.15, duration), cleaned)]
 
 
 def process_video(
@@ -400,6 +382,17 @@ def process_video(
         caption_events = manual_caption(manual_caption_text, intro_duration)
         if not caption_events:
             raise MediaError("Digite o texto da legenda manual.")
+
+    # Regra do produto: a legenda é uma única frase fixa durante todo o primeiro take.
+    # OCR/Whisper podem produzir vários eventos internos, mas eles são unidos antes do render.
+    if caption_events and caption_mode in {
+        "Transcrever o áudio automaticamente",
+        "Copiar o texto escrito no vídeo original",
+    }:
+        combined = " ".join(
+            " ".join(event.text.split()) for event in caption_events if event.text.strip()
+        ).strip()
+        caption_events = [CaptionEvent(0.0, max(0.15, intro_duration), combined)] if combined else []
 
     caption_overlays: list[CaptionOverlay] = []
     if caption_events:

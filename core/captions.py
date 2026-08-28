@@ -634,25 +634,90 @@ def _ocr_frame(image, lang: str) -> tuple[str, float]:
     return text, average
 
 
-def _ocr_frame_best(frame, lang: str) -> tuple[str, float]:
-    """Roda as variantes do quadro (cinza / texto isolado) e fica com a de maior confiança.
+def _ocr_candidate_score(text: str, confidence: float) -> float:
+    """Pontua OCR favorecendo a frase completa, não só a confiança do Tesseract."""
+    flat = clean_review_text(re.sub(r"\s*\n\s*", " ", text or ""))
+    words = re.findall(r"[A-Za-zÀ-ÿ0-9]+", flat)
+    letters = len(re.findall(r"[A-Za-zÀ-ÿ]", flat))
+    # Uma palavra extra vale mais do que alguns pontos de confiança. Isso evita
+    # escolher "aqui hoje..." (95%) no lugar de "vem aqui hoje..." (86%).
+    return float(confidence) * 0.35 + len(words) * 6.0 + min(letters, 180) * 0.08
 
-    Antes, as leituras de TODOS os quadros e variantes iam para um único
-    balaio e a função escolhia por votação global qual string era mais
-    comum. Isso só funciona se a legenda for estática. Quando ela muda de
-    frase ao longo do take (efeito karaokê, vários cartões de texto — muito
-    comum em Reels/TikTok), cada quadro tem um texto diferente e o "voto"
-    acaba pegando um fragmento qualquer em vez da legenda inteira. Aqui cada
-    quadro contribui com UMA leitura representativa; quem reconstrói a
-    legenda completa em ordem cronológica é ``read_burned_caption``.
-    """
+
+def _ocr_frame_best(frame, lang: str) -> tuple[str, float]:
+    """Escolhe a leitura mais completa entre as variantes do mesmo quadro."""
     best_text = ""
     best_conf = 0.0
+    best_score = float("-inf")
     for variant in _ocr_variants(frame):
         text, confidence = _ocr_frame(variant, lang)
-        if text and (not best_text or confidence > best_conf):
-            best_text, best_conf = text, confidence
+        if not text:
+            continue
+        text = clean_review_text(re.sub(r"\s*\n\s*", " ", text))
+        score = _ocr_candidate_score(text, confidence)
+        if score > best_score:
+            best_text, best_conf, best_score = text, confidence, score
     return best_text, best_conf
+
+
+def _word_tokens(value: str) -> list[str]:
+    return re.findall(r"\S+", clean_review_text(re.sub(r"\s+", " ", value or "")))
+
+
+def _token_key(token: str) -> str:
+    return re.sub(r"[^a-z0-9à-ÿ]", "", token.lower())
+
+
+def _merge_caption_candidates(texts: list[str]) -> str:
+    """Une somente sobreposições seguras para recuperar início/fim perdido pelo OCR.
+
+    Ex.: "vem aqui hoje tomar um vinho cmg" +
+         "aqui hoje tomar um vinho cmg, não vai rolar nada"
+    vira uma única frase completa.
+    """
+    clean = [clean_review_text(re.sub(r"\s+", " ", t or "")).strip() for t in texts]
+    clean = [t for t in clean if t]
+    if not clean:
+        return ""
+
+    # Começa pela leitura mais completa.
+    base = max(clean, key=lambda t: (len(_word_tokens(t)), len(t)))
+    base_tokens = _word_tokens(base)
+
+    for candidate in sorted(clean, key=lambda t: (len(_word_tokens(t)), len(t)), reverse=True):
+        cand_tokens = _word_tokens(candidate)
+        if not cand_tokens or candidate == base:
+            continue
+
+        base_keys = [_token_key(t) for t in base_tokens]
+        cand_keys = [_token_key(t) for t in cand_tokens]
+
+        # Se uma leitura já está contida na outra, não adiciona nada.
+        base_norm = " ".join(base_keys)
+        cand_norm = " ".join(cand_keys)
+        if cand_norm and cand_norm in base_norm:
+            continue
+        if base_norm and base_norm in cand_norm:
+            base_tokens = cand_tokens
+            continue
+
+        max_overlap = min(len(base_tokens), len(cand_tokens), 12)
+        merged = False
+        for overlap in range(max_overlap, 1, -1):
+            # candidato termina onde a base começa -> recupera prefixo
+            if cand_keys[-overlap:] == base_keys[:overlap]:
+                base_tokens = cand_tokens[:-overlap] + base_tokens
+                merged = True
+                break
+            # base termina onde o candidato começa -> recupera sufixo
+            if base_keys[-overlap:] == cand_keys[:overlap]:
+                base_tokens = base_tokens + cand_tokens[overlap:]
+                merged = True
+                break
+        if merged:
+            continue
+
+    return clean_review_text(" ".join(base_tokens))
 
 
 def _normalized_ocr(value: str) -> str:
@@ -681,22 +746,11 @@ def read_burned_caption(
     *,
     language: str = "",
 ) -> tuple[list[CaptionEvent], str]:
-    """Lê o(s) texto(s) escrito(s) (queimado) nos quadros do primeiro take.
+    """Lê uma legenda fixa do primeiro take e a mantém durante todo o take.
 
-    Amostra vários quadros ao longo do take — o número se adapta à duração,
-    com piso de 5 e teto de 16 amostras para não pesar demais no
-    processamento — e reconstrói a legenda EM ORDEM CRONOLÓGICA: leituras
-    parecidas em sequência viram um único "cartão" de texto (ficando com a
-    leitura de maior confiança entre elas); leituras claramente diferentes
-    viram cartões separados, cada um com seu próprio intervalo de tempo. Isso
-    evita que uma legenda que muda de frase durante o take seja reduzida a um
-    fragmento aleatório, e evita amontoar textos de momentos diferentes numa
-    única legenda com linhas que não têm relação entre si.
-
-    Retorna uma lista de ``CaptionEvent`` já com tempo definido (prontos para
-    ``render_caption_overlays``) e um resumo em texto para o relatório.
-    Emojis não são reconhecidos por OCR e ficam de fora do texto lido — use
-    'Usar um texto fixo' para legendas com emoji.
+    A V3 não cria cartões temporizados. Ela lê vários quadros, agrupa leituras
+    semelhantes, recupera prefixos/sufixos perdidos e devolve UMA única
+    ``CaptionEvent`` de 0s até ``duration``.
     """
     try:
         import pytesseract
@@ -718,12 +772,23 @@ def read_burned_caption(
     langs = [code for code in [preferred, "por", "eng"] if code and code in available]
     lang = "+".join(dict.fromkeys(langs)) or "eng"
 
-    # V2: menos amostras. O OCR era uma das partes mais caras do fluxo.
-    step = OCR_SAMPLE_STEP_SECONDS
-    sample_count = max(3, min(OCR_MAX_SAMPLES, int(duration / step) + 1))
-    timestamps = [duration * (index + 0.5) / sample_count for index in range(sample_count)]
+    # Amostra cedo de propósito: palavras no começo da frase podem ficar menos
+    # nítidas em quadros posteriores por animação, movimento ou compressão.
+    max_samples = max(3, OCR_MAX_SAMPLES)
+    uniform_count = max(2, min(max_samples - 2, int(duration / OCR_SAMPLE_STEP_SECONDS) + 1))
+    early = [min(max(duration * 0.02, 0.03), max(duration - 0.02, 0.03))]
+    if duration > 0.35:
+        early.append(min(0.28, duration * 0.10))
+    uniform = [duration * (index + 0.5) / uniform_count for index in range(uniform_count)]
+    timestamps: list[float] = []
+    for value in early + uniform:
+        value = max(0.01, min(float(value), max(0.01, duration - 0.01)))
+        if all(abs(value - existing) > 0.05 for existing in timestamps):
+            timestamps.append(value)
+        if len(timestamps) >= max_samples:
+            break
 
-    per_frame: list[tuple[float, str, float]] = []
+    readings: list[tuple[str, float]] = []
     for timestamp in timestamps:
         frame = _ocr_grab_frame(video_path, timestamp)
         if frame is None:
@@ -732,53 +797,55 @@ def read_burned_caption(
             text, confidence = _ocr_frame_best(frame, lang)
         except Exception as exc:
             raise MediaError(f"Falha ao ler a legenda do vídeo: {exc}") from exc
+        text = clean_review_text(re.sub(r"\s+", " ", text or ""))
         if text:
-            per_frame.append((timestamp, text, confidence))
+            readings.append((text, confidence))
 
-    if not per_frame:
+    if not readings:
         return [], ""
 
-    # Agrupa leituras vizinhas parecidas em "cartões" cronológicos.
-    cards: list[dict] = []
-    for timestamp, text, confidence in per_frame:
+    # Agrupamento GLOBAL (não cronológico): como a legenda é fixa, leituras
+    # "vem aqui hoje..." e "aqui hoje..." pertencem à mesma frase.
+    clusters: list[dict] = []
+    for text, confidence in readings:
         norm = _normalized_ocr(text)
-        if cards and _ocr_similarity(norm, cards[-1]["norm"]) >= _OCR_SIMILARITY_THRESHOLD:
-            card = cards[-1]
-            card["variants"].append((text, confidence))
-            card["end"] = timestamp
-            card["norm"] = norm
+        best_cluster = None
+        best_similarity = 0.0
+        for cluster in clusters:
+            similarity = max(_ocr_similarity(norm, item["norm"]) for item in cluster["items"])
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_cluster = cluster
+        if best_cluster is not None and best_similarity >= 0.60:
+            best_cluster["items"].append({"text": text, "confidence": confidence, "norm": norm})
         else:
-            cards.append(
-                {"variants": [(text, confidence)], "norm": norm, "start": timestamp, "end": timestamp}
-            )
+            clusters.append({"items": [{"text": text, "confidence": confidence, "norm": norm}]})
 
-    # Estende cada cartão até o início do próximo (sem deixar buracos) e faz
-    # o primeiro/último cobrirem as pontas do take.
-    for index in range(len(cards) - 1):
-        cards[index]["end"] = cards[index + 1]["start"]
-    cards[0]["start"] = 0.0
-    cards[-1]["end"] = max(duration, cards[-1]["end"])
+    # Prefere a frase vista em mais quadros. Em empate, usa completude + confiança.
+    def cluster_rank(cluster: dict) -> tuple[float, float]:
+        items = cluster["items"]
+        best = max(_ocr_candidate_score(i["text"], i["confidence"]) for i in items)
+        return (float(len(items)), best)
 
-    events: list[CaptionEvent] = []
-    confidences: list[float] = []
-    for card in cards:
-        best_text, best_confidence = max(card["variants"], key=lambda item: item[1])
-        # Leitura isolada (apareceu 1 única vez) e de baixa confiança: mais
-        # provável ser ruído (ícone, reflexo, textura) do que texto real.
-        if len(card["variants"]) == 1 and best_confidence < 60:
-            continue
-        start = max(0.0, min(card["start"], duration))
-        end = max(start + 0.15, min(card["end"], duration))
-        events.append(CaptionEvent(start=start, end=end, text=clean_review_text(best_text)))
-        confidences.append(best_confidence)
+    chosen = max(clusters, key=cluster_rank)
+    items = chosen["items"]
+    candidate_texts = [item["text"] for item in items]
+    merged = _merge_caption_candidates(candidate_texts)
 
-    if not events:
+    # Se a fusão não acrescentou nada, ainda escolhemos pela pontuação de
+    # completude, e não pela confiança isolada do Tesseract.
+    best_item = max(items, key=lambda i: _ocr_candidate_score(i["text"], i["confidence"]))
+    if len(_word_tokens(best_item["text"])) > len(_word_tokens(merged)):
+        merged = best_item["text"]
+
+    merged = clean_review_text(re.sub(r"\s+", " ", merged)).strip()
+    if not merged:
         return [], ""
 
-    average = sum(confidences) / len(confidences)
-    summary_text = "\n".join(event.text for event in events)
+    avg_conf = sum(float(i["confidence"]) for i in items) / max(len(items), 1)
+    event = CaptionEvent(start=0.0, end=max(0.15, duration), text=merged)
     summary = (
-        f"Texto detectado no vídeo (confiança aproximada {average:.0f}%):\n{summary_text}\n"
-        "Revise o texto antes de gerar. Emojis não são reconhecidos pelo OCR."
+        f"Legenda fixa detectada (confiança aproximada {avg_conf:.0f}%): {merged}\n"
+        "Ela ficará visível durante todo o primeiro take. Revise o texto antes de gerar."
     )
-    return events, summary
+    return [event], summary
