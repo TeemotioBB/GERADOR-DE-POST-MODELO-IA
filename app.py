@@ -45,6 +45,26 @@ CSS = """
 .status-ok {padding: 10px 12px; border-radius: 12px;}
 .small-note {font-size: .88rem; opacity: .75; line-height: 1.45;}
 .result-card {margin-top: 10px;}
+.ios-save-box {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: 16px;
+}
+.ios-save-btn {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: var(--button-primary-background-fill, #2563eb);
+  color: var(--button-primary-text-color, #fff) !important;
+  text-decoration: none !important;
+  text-align: center;
+  font-weight: 800;
+  font-size: 1rem;
+}
+.ios-save-btn:hover {filter: brightness(.96);}
 @media (max-width: 700px) {
   .hero-v2 {padding: 18px 16px;}
   .step-card {padding: 10px !important;}
@@ -64,16 +84,33 @@ def _language_code(label: str) -> str:
 
 
 def _video_player_html(output_path: str) -> str:
+    """Player alternativo + fluxo correto para salvar no app Fotos do iPhone.
+
+    Não usamos atributo ``download`` no link: no Safari isso força o arquivo
+    para Downloads/Arquivos. A rota /midia entrega o MP4 como ``inline``; ao
+    abrir o vídeo diretamente, o Safari usa o player nativo e o menu
+    Compartilhar oferece a opção "Salvar Vídeo" quando o iOS reconhece o MP4.
+    """
     job_id = Path(output_path).parent.name
     if not _JOB_ID_RE.match(job_id):
         return ""
     url = f"/midia/{job_id}.mp4"
     return f"""
-    <div style="margin-top:10px">
-      <video controls playsinline preload="metadata" style="width:100%;max-height:680px;border-radius:14px;background:#000" src="{url}"></video>
-      <div class="small-note" style="margin-top:8px">
-        Se o player acima não abrir no seu celular, <a href="{url}" target="_blank" rel="noopener"><b>abra o vídeo em uma nova aba</b></a>.
+    <div class="ios-save-box">
+      <a class="ios-save-btn" href="{url}" target="_blank" rel="noopener">
+        📱 ABRIR NO SAFARI PARA SALVAR EM FOTOS
+      </a>
+      <div class="small-note" style="margin-top:10px">
+        <b>No iPhone:</b> toque no botão acima → o vídeo abrirá sozinho → toque em
+        <b>Compartilhar</b> → <b>Salvar Vídeo</b>.
+        <br>Não use "Salvar em Arquivos" se quiser que ele apareça no app Fotos.
       </div>
+      <details style="margin-top:10px">
+        <summary class="small-note" style="cursor:pointer">Player alternativo</summary>
+        <video controls playsinline preload="metadata"
+          style="width:100%;max-height:680px;border-radius:14px;background:#000;margin-top:8px"
+          src="{url}"></video>
+      </details>
     </div>
     """
 
@@ -494,7 +531,7 @@ with gr.Blocks(title=APP_NAME) as demo:
 
     with gr.Group(elem_classes=["step-card", "result-card"]):
         gr.HTML('<div class="step-title">Resultado</div>')
-        output_video = gr.Video(label="Vídeo pronto", format="mp4", interactive=False)
+        output_video = gr.Video(label="Vídeo pronto", format="mp4", interactive=False, buttons=[])
         fallback_player = gr.HTML()
         report = gr.Markdown()
 
