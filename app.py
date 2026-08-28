@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from core.captions import CaptionEvent, read_burned_caption, render_caption_overlays, transcribe_intro
+from core.captions import CaptionEvent, clean_review_text, read_burned_caption, render_caption_overlays, transcribe_intro
 from core.config import APP_NAME, MAX_INSTAGRAM_DOWNLOAD_MB, WORK_ROOT
 from core.media import MediaError, probe_video
 from core.processor import cleanup_old_jobs, process_video
@@ -189,8 +189,11 @@ def analyze_source(video_path: str | None, caption_source: str, language_label: 
     else:
         raise gr.Error("Escolha uma opção de legenda válida.")
 
-    text = "\n".join(event.text.strip() for event in events if event.text.strip()).strip()
-    timings = [{"start": event.start, "end": event.end} for event in events]
+    # A legenda do produto é sempre UMA frase fixa no primeiro take.
+    text = clean_review_text(
+        " ".join(" ".join(event.text.split()) for event in events if event.text.strip())
+    ).strip()
+    timings = [{"start": 0.0, "end": intro_duration}] if text else []
 
     if caption_source == "Copiar texto escrito no vídeo" and not text:
         caption_note = "⚠️ Não consegui ler texto com confiança. Você pode digitar/corrigir manualmente no campo abaixo."
@@ -279,10 +282,10 @@ def preview_image(
     try:
         final = base.convert("RGBA")
         if caption_source != "Sem legenda" and (reviewed_text or "").strip():
-            # A prévia mostra a primeira frase/cartão, sem renderizar um MP4 inteiro.
-            first_text = next((line.strip() for line in reviewed_text.splitlines() if line.strip()), "")
+            # A prévia usa a legenda inteira; no vídeo ela fica fixa durante todo o primeiro take.
+            fixed_text = reviewed_text.strip()
             overlays = render_caption_overlays(
-                [CaptionEvent(0.0, 1.0, first_text)],
+                [CaptionEvent(0.0, 1.0, fixed_text)],
                 preview_dir,
                 width=final.width,
                 height=final.height,
