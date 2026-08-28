@@ -412,7 +412,7 @@ def _render_caption_canvas(
 ) -> Image.Image:
     normal_path = _normal_font_path()
     emoji_path = _emoji_font_path()
-    requested_size = max(24, int(round(height * max(2.0, min(font_percent, 9.0)) / 100.0)))
+    requested_size = max(24, int(round(height * max(2.0, min(font_percent, 12.0)) / 100.0)))
     max_text_width = int(round(width * 0.90))
 
     font_size = requested_size
