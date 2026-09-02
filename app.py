@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import secrets
 import shutil
 import uuid
 from pathlib import Path
@@ -10,7 +9,7 @@ from pathlib import Path
 import cv2
 import gradio as gr
 import uvicorn
-from fastapi import FastAPI, Header
+from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -134,23 +133,55 @@ def _analysis_work_dir() -> Path:
     return path
 
 
-def analyze_source(video_path: str | None, caption_source: str, language_label: str, ocr_region: str):
+def analyze_source(
+    video_path: str | None,
+    caption_source: str,
+    language_label: str,
+    requested_transition_mode: str,
+    manual_transition_seconds: float | None,
+):
     if not video_path:
         raise gr.Error("Adicione o vídeo original primeiro.")
 
     cleanup_old_jobs()
     try:
         info = probe_video(video_path)
-        detected = detect_intro_end(video_path)
     except MediaError as exc:
         raise gr.Error(str(exc)) from exc
 
-    if detected.seconds is None:
+    # Regra desta operação: o formato normal possui EXATAMENTE dois takes.
+    # Portanto uma falha do detector nunca pode virar silenciosamente
+    # "sem continuação", pois isso destruiria a estrutura do vídeo.
+    if requested_transition_mode == "Informar o segundo manualmente":
+        if manual_transition_seconds is None:
+            raise gr.Error("Informe o segundo em que começa o take 2.")
+        try:
+            transition = float(manual_transition_seconds)
+        except (TypeError, ValueError) as exc:
+            raise gr.Error("O segundo da troca é inválido.") from exc
+        if transition <= 0 or transition >= info.duration:
+            raise gr.Error(
+                f"O segundo da troca deve ser maior que 0 e menor que {info.duration:.2f}s."
+            )
+        has_continuation = True
+        transition_mode = "Informar o segundo manualmente"
+        transition_message = f"Troca manual definida em {transition:.2f}s."
+    elif requested_transition_mode == "Sem vídeo de continuação":
         transition = info.duration
         has_continuation = False
         transition_mode = "Sem vídeo de continuação"
-        transition_message = "Nenhuma troca segura foi encontrada; o primeiro take será mantido até o final."
+        transition_message = "Modo excepcional: vídeo tratado sem take 2."
     else:
+        try:
+            detected = detect_intro_end(video_path)
+        except MediaError as exc:
+            raise gr.Error(str(exc)) from exc
+        if detected.seconds is None:
+            raise gr.Error(
+                "Não encontrei a troca entre os 2 takes com segurança. "
+                "Abra Configurações avançadas, escolha 'Informar o segundo manualmente', "
+                "digite o instante em que começa o take 2 e clique em Analisar vídeo novamente."
+            )
         transition = min(max(float(detected.seconds), 0.1), info.duration - 0.05)
         has_continuation = True
         transition_mode = "Informar o segundo manualmente"
@@ -166,8 +197,7 @@ def analyze_source(video_path: str | None, caption_source: str, language_label: 
             events, summary = read_burned_caption(
                 video_path,
                 intro_duration,
-                language=language,
-                region=ocr_region,
+                language=language or "pt",
             )
         except MediaError as exc:
             raise gr.Error(str(exc)) from exc
@@ -198,7 +228,10 @@ def analyze_source(video_path: str | None, caption_source: str, language_label: 
     timings = [{"start": 0.0, "end": intro_duration}] if text else []
 
     if caption_source == "Copiar texto escrito no vídeo" and not text:
-        caption_note = "⚠️ Não consegui ler texto com confiança. Você pode digitar/corrigir manualmente no campo abaixo."
+        caption_note = (
+            "⚠️ Não encontrei um texto FIXO repetido com confiança. "
+            "Preferi não puxar texto aleatório; corrija/digite abaixo."
+        )
     elif caption_source == "Transcrever o áudio" and not text:
         caption_note = "⚠️ Não encontrei fala clara. Você pode digitar o texto manualmente."
     elif caption_source == "Sem legenda":
@@ -206,7 +239,7 @@ def analyze_source(video_path: str | None, caption_source: str, language_label: 
     elif caption_source == "Digitar manualmente":
         caption_note = "Digite o texto que deseja usar antes de pré-visualizar."
     else:
-        caption_note = "✅ Texto detectado. Revise antes de gerar — você pode editar qualquer palavra."
+        caption_note = "✅ Texto fixo detectado por repetição em vários frames. Revise antes de gerar."
 
     state = {
         "video_path": video_path,
@@ -214,12 +247,10 @@ def analyze_source(video_path: str | None, caption_source: str, language_label: 
         "transition": transition,
         "has_continuation": has_continuation,
         "caption_source": caption_source,
-        "ocr_region": ocr_region,
     }
 
     details = f"### Análise concluída\n**{transition_message}**\n\n{caption_note}"
     if summary and caption_source in {"Copiar texto escrito no vídeo", "Transcrever o áudio"}:
-        # O texto já aparece no campo editável; aqui mostramos só informação curta.
         first_line = summary.splitlines()[0] if summary.splitlines() else ""
         if first_line:
             details += f"\n\n<span style='opacity:.72'>{first_line}</span>"
@@ -416,7 +447,7 @@ with gr.Blocks(title=APP_NAME) as demo:
         import_status = gr.Markdown()
 
     with gr.Group(elem_classes=["step-card"]):
-        gr.HTML('<div class="step-title">2. Analisar conteúdo</div><div class="step-help">Detecta a troca do take e procura a legenda fixa por consenso entre vários quadros, ignorando textos aleatórios sempre que possível.</div>')
+        gr.HTML('<div class="step-title">2. Analisar conteúdo</div><div class="step-help">Detecta a troca entre os 2 takes e procura somente o texto fixo do primeiro take.</div>')
         caption_source = gr.Radio(
             choices=[
                 "Copiar texto escrito no vídeo",
@@ -487,24 +518,11 @@ with gr.Blocks(title=APP_NAME) as demo:
             value="Manter inteiro com fundo desfocado",
             label="Encaixe da continuação",
         )
-        with gr.Row():
-            ocr_region = gr.Dropdown(
-                choices=[
-                    "Automática (recomendado)",
-                    "Parte superior",
-                    "Centro",
-                    "Parte inferior",
-                    "Tela quase inteira",
-                ],
-                value="Automática (recomendado)",
-                label="Onde procurar o texto escrito",
-                info="Se o OCR puxar watermark, placa ou texto do cenário, escolha a faixa onde a legenda realmente fica.",
-            )
-            language = gr.Dropdown(
-                choices=["Português", "Detectar automaticamente", "Inglês", "Espanhol"],
-                value="Português",
-                label="Idioma",
-            )
+        language = gr.Dropdown(
+            choices=["Português", "Detectar automaticamente", "Inglês", "Espanhol"],
+            value="Português",
+            label="Idioma",
+        )
 
     generate_button = gr.Button("✨ GERAR VÍDEO FINAL", variant="primary", elem_id="generate-btn")
 
@@ -541,7 +559,7 @@ with gr.Blocks(title=APP_NAME) as demo:
     )
     analyze_button.click(
         fn=analyze_source,
-        inputs=[video_path_state, caption_source, language, ocr_region],
+        inputs=[video_path_state, caption_source, language, transition_mode, manual_transition],
         outputs=[
             analysis_result,
             reviewed_text,
@@ -624,16 +642,7 @@ def api_info():
 
 
 @fastapi_app.post("/api/import-video")
-def api_import_video(data: dict, x_api_token: str | None = Header(default=None, alias="X-API-Token")):
-    # O botão da interface NÃO usa esta rota; ela existe apenas para integrações
-    # externas. Sem API_TOKEN configurado, fica desativada para impedir que
-    # terceiros usem seu Railway como downloader e gerem custo.
-    configured_token = os.getenv("API_TOKEN", "").strip()
-    if not configured_token:
-        return JSONResponse({"erro": "API externa desativada"}, status_code=404)
-    if not x_api_token or not secrets.compare_digest(x_api_token, configured_token):
-        return JSONResponse({"erro": "Não autorizado"}, status_code=401)
-
+def api_import_video(data: dict):
     url = (data.get("url") or "").strip()
     if not url:
         return JSONResponse({"erro": "URL não fornecida"}, status_code=400)
