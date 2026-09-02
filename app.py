@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import shutil
 import uuid
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import cv2
 import gradio as gr
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -133,7 +134,7 @@ def _analysis_work_dir() -> Path:
     return path
 
 
-def analyze_source(video_path: str | None, caption_source: str, language_label: str):
+def analyze_source(video_path: str | None, caption_source: str, language_label: str, ocr_region: str):
     if not video_path:
         raise gr.Error("Adicione o vídeo original primeiro.")
 
@@ -165,7 +166,8 @@ def analyze_source(video_path: str | None, caption_source: str, language_label: 
             events, summary = read_burned_caption(
                 video_path,
                 intro_duration,
-                language=language or "pt",
+                language=language,
+                region=ocr_region,
             )
         except MediaError as exc:
             raise gr.Error(str(exc)) from exc
@@ -212,6 +214,7 @@ def analyze_source(video_path: str | None, caption_source: str, language_label: 
         "transition": transition,
         "has_continuation": has_continuation,
         "caption_source": caption_source,
+        "ocr_region": ocr_region,
     }
 
     details = f"### Análise concluída\n**{transition_message}**\n\n{caption_note}"
@@ -413,7 +416,7 @@ with gr.Blocks(title=APP_NAME) as demo:
         import_status = gr.Markdown()
 
     with gr.Group(elem_classes=["step-card"]):
-        gr.HTML('<div class="step-title">2. Analisar conteúdo</div><div class="step-help">Detecta a troca do take e extrai o texto uma única vez.</div>')
+        gr.HTML('<div class="step-title">2. Analisar conteúdo</div><div class="step-help">Detecta a troca do take e procura a legenda fixa por consenso entre vários quadros, ignorando textos aleatórios sempre que possível.</div>')
         caption_source = gr.Radio(
             choices=[
                 "Copiar texto escrito no vídeo",
@@ -484,11 +487,24 @@ with gr.Blocks(title=APP_NAME) as demo:
             value="Manter inteiro com fundo desfocado",
             label="Encaixe da continuação",
         )
-        language = gr.Dropdown(
-            choices=["Português", "Detectar automaticamente", "Inglês", "Espanhol"],
-            value="Português",
-            label="Idioma",
-        )
+        with gr.Row():
+            ocr_region = gr.Dropdown(
+                choices=[
+                    "Automática (recomendado)",
+                    "Parte superior",
+                    "Centro",
+                    "Parte inferior",
+                    "Tela quase inteira",
+                ],
+                value="Automática (recomendado)",
+                label="Onde procurar o texto escrito",
+                info="Se o OCR puxar watermark, placa ou texto do cenário, escolha a faixa onde a legenda realmente fica.",
+            )
+            language = gr.Dropdown(
+                choices=["Português", "Detectar automaticamente", "Inglês", "Espanhol"],
+                value="Português",
+                label="Idioma",
+            )
 
     generate_button = gr.Button("✨ GERAR VÍDEO FINAL", variant="primary", elem_id="generate-btn")
 
@@ -525,7 +541,7 @@ with gr.Blocks(title=APP_NAME) as demo:
     )
     analyze_button.click(
         fn=analyze_source,
-        inputs=[video_path_state, caption_source, language],
+        inputs=[video_path_state, caption_source, language, ocr_region],
         outputs=[
             analysis_result,
             reviewed_text,
@@ -608,7 +624,16 @@ def api_info():
 
 
 @fastapi_app.post("/api/import-video")
-def api_import_video(data: dict):
+def api_import_video(data: dict, x_api_token: str | None = Header(default=None, alias="X-API-Token")):
+    # O botão da interface NÃO usa esta rota; ela existe apenas para integrações
+    # externas. Sem API_TOKEN configurado, fica desativada para impedir que
+    # terceiros usem seu Railway como downloader e gerem custo.
+    configured_token = os.getenv("API_TOKEN", "").strip()
+    if not configured_token:
+        return JSONResponse({"erro": "API externa desativada"}, status_code=404)
+    if not x_api_token or not secrets.compare_digest(x_api_token, configured_token):
+        return JSONResponse({"erro": "Não autorizado"}, status_code=401)
+
     url = (data.get("url") or "").strip()
     if not url:
         return JSONResponse({"erro": "URL não fornecida"}, status_code=400)

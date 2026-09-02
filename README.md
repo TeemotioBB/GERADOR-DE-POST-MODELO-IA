@@ -122,3 +122,24 @@ TEMP_MAX_AGE_HOURS=3
 ```
 
 `TRANSITION_MAX_SCAN_SECONDS` define por quanto tempo o detector procura a primeira troca. `TEMP_MAX_AGE_HOURS` controla quando os downloads e resultados temporários antigos são apagados.
+
+## Melhorias desta revisão (OCR V4)
+
+A leitura de texto escrito no vídeo foi tornada **conservadora**: o sistema não junta mais todo texto encontrado no frame. Ele identifica blocos com posição, compara vários quadros e prioriza o texto que reaparece no mesmo lugar. Isso reduz a chance de copiar watermark, placa, username, preço ou texto do cenário.
+
+Principais mudanças:
+
+- consenso temporal + espacial entre vários frames;
+- limite de palavras no score (texto aleatório longo não ganha automaticamente);
+- Português usa `por` sem misturar `eng` quando o idioma foi escolhido explicitamente;
+- remoção da conversão automática de `|` para `I`;
+- rejeição de leitura instável/baixa confiança em vez de preencher o campo com lixo;
+- seletor **Onde procurar o texto escrito**: automático, superior, centro, inferior ou tela quase inteira;
+- leitura dos frames com um único `VideoCapture`, reduzindo overhead;
+- a saída agora preserva a proporção/resolução do vídeo original, em vez de herdar o formato da foto da personagem;
+- continuação de vídeo e áudio usam o mesmo timestamp de transição, evitando o deslocamento de ~70 ms da versão anterior;
+- `url_import.py` virou apenas uma camada de compatibilidade; a lógica de Instagram fica em um único arquivo (`core/instagram_import.py`).
+
+### Como usar o OCR
+
+Comece com **Automática (recomendado)**. Se a legenda estiver sempre no topo/centro/baixo e o vídeo contiver outros textos, escolha a faixa correspondente antes de clicar em **ANALISAR VÍDEO**. Se não houver evidência estável suficiente, o sistema deixa o campo vazio de propósito para você corrigir manualmente — isso é preferível a gerar uma legenda incorreta.
