@@ -123,8 +123,7 @@ def probe_video(path: str | Path) -> VideoInfo:
         raise MediaError("Não foi possível identificar a duração do vídeo.")
 
     fps = _parse_rate(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate"))
-    # Não aumente artificialmente FPS baixo: isso altera timestamps e pode encurtar o vídeo.
-    fps = min(max(fps, 1.0), 60.0)
+    fps = min(max(fps, 12.0), 60.0)
 
     width = int(video_stream["width"])
     height = int(video_stream["height"])

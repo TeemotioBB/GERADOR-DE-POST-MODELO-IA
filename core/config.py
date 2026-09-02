@@ -32,8 +32,8 @@ TRANSITION_MAX_SCAN_SECONDS = max(5.0, float(os.getenv("TRANSITION_MAX_SCAN_SECO
 TEMP_MAX_AGE_HOURS = max(0.25, float(os.getenv("TEMP_MAX_AGE_HOURS", "1.5")))
 
 # OCR: menos amostras e recorte da interface do Reel reduzem custo e ruído.
-OCR_MAX_SAMPLES = max(3, int(os.getenv("OCR_MAX_SAMPLES", "8")))
+OCR_MAX_SAMPLES = max(4, int(os.getenv("OCR_MAX_SAMPLES", "8")))
 OCR_SAMPLE_STEP_SECONDS = max(0.4, float(os.getenv("OCR_SAMPLE_STEP_SECONDS", "0.9")))
-OCR_CROP_TOP_PERCENT = min(35.0, max(0.0, float(os.getenv("OCR_CROP_TOP_PERCENT", "5"))))
-OCR_CROP_BOTTOM_PERCENT = min(35.0, max(0.0, float(os.getenv("OCR_CROP_BOTTOM_PERCENT", "8"))))
-OCR_CROP_SIDE_PERCENT = min(25.0, max(0.0, float(os.getenv("OCR_CROP_SIDE_PERCENT", "1"))))
+OCR_CROP_TOP_PERCENT = min(20.0, max(0.0, float(os.getenv("OCR_CROP_TOP_PERCENT", "1"))))
+OCR_CROP_BOTTOM_PERCENT = min(20.0, max(0.0, float(os.getenv("OCR_CROP_BOTTOM_PERCENT", "3"))))
+OCR_CROP_SIDE_PERCENT = min(15.0, max(0.0, float(os.getenv("OCR_CROP_SIDE_PERCENT", "0"))))

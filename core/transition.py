@@ -18,16 +18,23 @@ class TransitionResult:
 
 
 def _normalize_frame(frame: np.ndarray, target_width: int = 224) -> np.ndarray:
+    """Reduz o quadro preservando COR.
+
+    A versão anterior convertia tudo para cinza. Dois takes com cores bem
+    diferentes, mas luminância parecida, podiam parecer quase iguais e o corte
+    passava despercebido. O detector agora mede mudança espacial em BGR e usa
+    histograma cinza apenas como uma das evidências.
+    """
     height, width = frame.shape[:2]
     scale = target_width / max(width, 1)
     target_height = max(96, int(round(height * scale)))
     resized = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
-    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    return cv2.GaussianBlur(gray, (5, 5), 0)
+    return cv2.GaussianBlur(resized, (5, 5), 0)
 
 
 def _gray_hist(frame: np.ndarray) -> np.ndarray:
-    hist = cv2.calcHist([frame], [0], None, [64], [0, 256])
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
     cv2.normalize(hist, hist)
     return hist
 
@@ -38,7 +45,12 @@ def _difference_features(reference: np.ndarray, current: np.ndarray) -> tuple[fl
         current = cv2.resize(current, (reference.shape[1], reference.shape[0]))
 
     diff = cv2.absdiff(reference, current)
-    changed = diff >= 24
+    # Em quadro colorido, um pixel conta como alterado quando qualquer canal
+    # mudou de forma relevante. Isso evita perder cortes vermelho->verde etc.
+    if diff.ndim == 3:
+        changed = np.max(diff, axis=2) >= 24
+    else:
+        changed = diff >= 24
     global_ratio = float(np.mean(changed))
     mean_diff = float(np.mean(diff) / 255.0)
 
