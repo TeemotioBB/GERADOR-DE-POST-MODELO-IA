@@ -27,7 +27,7 @@ from .config import (
     TEMP_MAX_AGE_HOURS,
     WORK_ROOT,
 )
-from .media import MediaError, PreparedIntroMedia, prepare_intro_media, probe_video, require_binary, run_command
+from .media import MediaError, PreparedIntroMedia, prepare_intro_media, probe_video, require_binary, run_command, scaled_even_dimensions
 from .transition import TransitionResult, detect_intro_end
 
 ProgressFn = Callable[[float, str], None]
@@ -223,14 +223,11 @@ def _build_filter_complex(
     intro_label = "introready"
 
     if has_continuation:
-        # Margem de segurança de ~2 quadros: vídeos de celular (VFR) podem ter
-        # timestamps levemente imprecisos e deixar 1-2 quadros da cena antiga
-        # "vazarem" no início da continuação. Pular 0.07s do vídeo original a
-        # partir da troca elimina isso sem efeito visível no take de continuação.
-        safety_margin = 0.07
-        continuation_start = min(transition + safety_margin, max(transition, duration - 0.05))
+        # A continuação começa exatamente no mesmo timestamp usado pelo áudio.
+        # A versão anterior pulava 0.07s de vídeo para esconder possíveis quadros
+        # residuais, mas isso criava um pequeno descompasso A/V após a troca.
         chains.append(
-            f"[1:v]trim=start={continuation_start:.6f},setpts=PTS-STARTPTS[contsrc]"
+            f"[1:v]trim=start={transition:.6f},setpts=PTS-STARTPTS[contsrc]"
         )
         fit_chain, cont_label = _fit_filter("contsrc", width, height, fps, fit_mode)
         chains.append(fit_chain)
@@ -335,8 +332,14 @@ def process_video(
     if intro_media.kind == "video" and (intro_media.duration or 0) <= 0:
         raise MediaError("O vídeo enviado como mídia inicial possui duração inválida.")
 
-    output_w = intro_media.output_width
-    output_h = intro_media.output_height
+    # A saída deve preservar o formato do Reel original. Antes, a resolução
+    # final herdava a foto/vídeo da modelo; uma imagem 4:5 podia transformar um
+    # Reel 9:16 inteiro em 4:5. A nova mídia agora é encaixada no canvas original.
+    output_w, output_h = scaled_even_dimensions(
+        info.width,
+        info.height,
+        OUTPUT_MAX_LONG_EDGE,
+    )
 
     _safe_progress(progress, 0.16, "Identificando onde termina o primeiro take...")
     transition, detection, has_continuation = _resolve_transition(
@@ -527,15 +530,15 @@ def process_video(
             )
 
     size_note = ""
-    if max(intro_media.original_width, intro_media.original_height) > max(output_w, output_h) + 1:
+    if (info.width, info.height) != (output_w, output_h):
         size_note = (
-            f"\n- Resolução otimizada: a mídia era {intro_media.original_width}×{intro_media.original_height}; "
-            f"a saída ficou {output_w}×{output_h}, preservando a proporção."
+            f"\n- Resolução do Reel otimizada: o original era {info.width}×{info.height}; "
+            f"a saída ficou {output_w}×{output_h}, preservando a proporção do vídeo original."
         )
     elif (intro_media.original_width, intro_media.original_height) != (output_w, output_h):
         size_note = (
-            f"\n- Compatibilidade H.264: a mídia era {intro_media.original_width}×{intro_media.original_height}; "
-            f"a saída ficou {output_w}×{output_h} com dimensões pares."
+            f"\n- Canvas preservado em {output_w}×{output_h}; a nova mídia "
+            f"({intro_media.original_width}×{intro_media.original_height}) foi encaixada sem alterar o formato do Reel."
         )
 
     transcript_line = ""
