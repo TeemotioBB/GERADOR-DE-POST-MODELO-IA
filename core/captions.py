@@ -1297,7 +1297,29 @@ def _repair_caption_edges(base: str, candidates: list[str]) -> str:
         if 0 < len(cand_prefix) <= 3 and len(base_prefix) <= 3:
             bp = " ".join(base_prefix)
             cp = " ".join(cand_prefix)
-            if _refined_text_score(cp) > _refined_text_score(bp) + 7.0:
+
+            # Recuperação especial da primeira palavra. Em legendas grandes com
+            # contorno/aspas, o Tesseract frequentemente lê "Vai" como apenas
+            # "A" ou perde a primeira letra. Se o restante da frase concorda
+            # por pelo menos 4 tokens, uma alternativa curta e lexicalmente
+            # plausível pode corrigir a borda sem precisar superar o prefixo
+            # antigo por uma margem artificial de +7 pontos.
+            strong_shared_body = k >= 4
+            one_word_edge = len(base_prefix) == 1 and len(cand_prefix) == 1
+            base_key = _token_key(base_prefix[0]) if one_word_edge else ""
+            cand_key = _token_key(cand_prefix[0]) if one_word_edge else ""
+            candidate_is_common = cand_key in _COMMON_PT_WORDS
+            candidate_is_more_informative = len(cand_key) >= len(base_key) + 2
+
+            should_replace_first_word = (
+                strong_shared_body
+                and one_word_edge
+                and candidate_is_common
+                and candidate_is_more_informative
+                and _refined_text_score(cp) >= _refined_text_score(bp) - 1.0
+            )
+
+            if should_replace_first_word or _refined_text_score(cp) > _refined_text_score(bp) + 7.0:
                 result = cand_prefix + result[i:]
                 i = len(cand_prefix)
 
