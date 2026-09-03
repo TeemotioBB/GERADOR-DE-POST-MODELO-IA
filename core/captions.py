@@ -1154,12 +1154,166 @@ def _refine_caption_region(
     return refined
 
 
-def _refined_text_score(text: str) -> float:
-    words = len(_word_tokens(text))
-    letters = len(re.findall(r"[A-Za-zÀ-ÿ]", text))
-    weird = len(re.findall(r"[^A-Za-zÀ-ÿ0-9\s,.;:!?@#'\-]", text))
-    return min(words, 22) * 8.0 + min(letters, 180) * 0.12 - weird * 4.0
+_COMMON_PT_WORDS = {
+    "a", "ao", "aos", "as", "com", "da", "das", "de", "do", "dos",
+    "e", "ela", "ele", "em", "eu", "isso", "me", "meu", "minha",
+    "na", "nas", "no", "nos", "não", "o", "os", "ou", "para", "por",
+    "pra", "que", "se", "sem", "só", "te", "tem", "tu", "um", "uma",
+    "vai", "vc", "você", "vocês", "tudo", "quando", "como", "mas", "mais",
+}
 
+
+def _refined_text_score(text: str) -> float:
+    """Pontua naturalidade de uma frase, sem premiar OCR longo e cheio de lixo.
+
+    A versão V2 dava +8 por qualquer token. Assim, uma leitura como
+    ``di engolir tudo ob vate / 7 As ...`` podia vencer uma frase correta
+    simplesmente por conter mais pedaços. Aqui o sinal principal passa a ser
+    proporção de letras + palavras plausíveis; símbolos soltos e tokens sem
+    letras recebem penalidade forte.
+    """
+    value = clean_review_text(re.sub(r"\s+", " ", text or "")).strip()
+    if not value:
+        return -999.0
+
+    tokens = _word_tokens(value)
+    letters = len(re.findall(r"[A-Za-zÀ-ÿ]", value))
+    visible = len(re.sub(r"\s+", "", value))
+    letter_ratio = letters / max(visible, 1)
+
+    weird_chars = len(re.findall(r'[^A-Za-zÀ-ÿ0-9\s,.;:!?@#\'"-]', value))
+    symbol_only = 0
+    suspicious_short = 0
+    common_hits = 0
+    numeric_only = 0
+
+    for token in tokens:
+        key = _token_key(token)
+        if not re.search(r"[A-Za-zÀ-ÿ]", token):
+            symbol_only += 1
+            if re.search(r"\d", token):
+                numeric_only += 1
+            continue
+        if key in _COMMON_PT_WORDS:
+            common_hits += 1
+        if len(key) <= 2 and key not in _COMMON_PT_WORDS:
+            suspicious_short += 1
+
+    # Comprimento conta pouco; qualidade lexical conta muito.
+    score = (
+        min(len(tokens), 24) * 2.0
+        + min(letters, 180) * 0.10
+        + letter_ratio * 42.0
+        + min(common_hits, 10) * 4.0
+        - weird_chars * 9.0
+        - symbol_only * 12.0
+        - numeric_only * 4.0
+        - suspicious_short * 3.5
+    )
+    return score
+
+
+def _choose_refined_candidate(candidates: list[str]) -> str:
+    """Escolhe a leitura que mais concorda com as outras, não a mais longa.
+
+    O texto do take 1 é fixo, portanto leituras corretas tendem a reaparecer em
+    vários frames/variantes. Ruído pode ser comprido, mas costuma ser isolado.
+    """
+    clean: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        item = clean_review_text(re.sub(r"\s+", " ", item or "")).strip()
+        norm = _normalized_ocr(item)
+        if not item or not norm or norm in seen:
+            continue
+        seen.add(norm)
+        clean.append(item)
+
+    if not clean:
+        return ""
+    if len(clean) == 1:
+        return clean[0]
+
+    def total_score(candidate: str) -> float:
+        norm = _normalized_ocr(candidate)
+        peers = []
+        for other in clean:
+            if other == candidate:
+                continue
+            onorm = _normalized_ocr(other)
+            similarity = _ocr_similarity(norm, onorm)
+            overlap = _token_overlap(norm, onorm)
+            peers.append(max(similarity, overlap))
+        peers.sort(reverse=True)
+        # As três concordâncias mais fortes bastam e evitam que dezenas de
+        # variantes ruins dominem por quantidade.
+        consensus = sum(peers[:3]) * 12.0
+        return _refined_text_score(candidate) + consensus
+
+    return max(clean, key=total_score)
+
+
+
+def _longest_common_token_block(a_tokens: list[str], b_tokens: list[str]) -> tuple[int, int, int]:
+    a = [_token_key(t) for t in a_tokens]
+    b = [_token_key(t) for t in b_tokens]
+    best = (0, 0, 0)
+    for i in range(len(a)):
+        if not a[i]:
+            continue
+        for j in range(len(b)):
+            if a[i] != b[j] or not b[j]:
+                continue
+            k = 0
+            while i + k < len(a) and j + k < len(b) and a[i + k] == b[j + k] and a[i + k]:
+                k += 1
+            if k > best[2]:
+                best = (i, j, k)
+    return best
+
+
+def _repair_caption_edges(base: str, candidates: list[str]) -> str:
+    """Corrige apenas prefixo/sufixo usando uma leitura que concorda no miolo.
+
+    Isso resolve o caso clássico do Tesseract em que as aspas de abertura +
+    primeira palavra viram lixo (ex.: ``al en engolir...``), sem concatenar
+    sobras incompatíveis no restante da frase.
+    """
+    base_tokens = _word_tokens(base)
+    if len(base_tokens) < 3:
+        return base
+
+    result = list(base_tokens)
+    for candidate in candidates:
+        cand_tokens = _word_tokens(candidate)
+        if len(cand_tokens) < 3:
+            continue
+        i, j, k = _longest_common_token_block(result, cand_tokens)
+        if k < 3:
+            continue
+
+        base_prefix = result[:i]
+        cand_prefix = cand_tokens[:j]
+        if 0 < len(cand_prefix) <= 3 and len(base_prefix) <= 3:
+            bp = " ".join(base_prefix)
+            cp = " ".join(cand_prefix)
+            if _refined_text_score(cp) > _refined_text_score(bp) + 7.0:
+                result = cand_prefix + result[i:]
+                i = len(cand_prefix)
+
+        # Recalcula o bloco após possível troca de prefixo para tratar a borda final.
+        i2, j2, k2 = _longest_common_token_block(result, cand_tokens)
+        if k2 < 3:
+            continue
+        base_suffix = result[i2 + k2:]
+        cand_suffix = cand_tokens[j2 + k2:]
+        if 0 < len(cand_suffix) <= 3 and len(base_suffix) <= 3:
+            bs = " ".join(base_suffix)
+            cs = " ".join(cand_suffix)
+            if _refined_text_score(cs) > _refined_text_score(bs) + 7.0:
+                result = result[:i2 + k2] + cand_suffix
+
+    return clean_review_text(" ".join(result)).strip()
 
 def read_burned_caption(
     video_path: str | Path,
@@ -1191,8 +1345,14 @@ def read_burned_caption(
         ) from exc
 
     preferred = _OCR_LANGUAGE_MAP.get((language or "").strip().lower())
-    langs = [code for code in [preferred, "por", "eng"] if code and code in available]
-    lang = "+".join(dict.fromkeys(langs)) or "eng"
+    # Se o usuário escolheu Português/Inglês/Espanhol, usa SOMENTE esse idioma.
+    # Misturar ``por+eng`` piora palavras portuguesas curtas e aumenta falsos
+    # positivos em fundo/roupa. Combinação só é usada no modo automático.
+    if preferred and preferred in available:
+        lang = preferred
+    else:
+        fallback = [code for code in ["por", "eng"] if code in available]
+        lang = "+".join(fallback) or "eng"
 
     max_samples = max(4, OCR_MAX_SAMPLES)
     timestamps = _sample_timestamps(float(duration), max_samples)
@@ -1232,17 +1392,29 @@ def read_burned_caption(
     # apagar prefixos legítimos como "eu:", "POV:" ou "ela:". Linhas curtas só
     # são descartadas quando também são visualmente bem menores que as demais.
     median_height = _median([line.h for line in chosen])
+    strongest_score = max((_persistent_line_score(line) for line in chosen), default=0.0)
     filtered = []
     for line in chosen:
         words = len(_word_tokens(line.text))
         letters = len(re.findall(r"[A-Za-zÀ-ÿ]", line.text))
+        line_score = _persistent_line_score(line)
+
         looks_tiny_auxiliary = (
             len(chosen) > 1
-            and line.h < median_height * 0.58
+            and line.h < median_height * 0.62
             and words <= 2
             and letters <= 14
         )
-        if not looks_tiny_auxiliary:
+        # Em fundo estático o Tesseract pode repetir a MESMA alucinação em todos
+        # os frames. Portanto persistência sozinha não basta. Se existe uma ou
+        # mais linhas grandes/fortes, descartamos fragmentos curtos que ficaram
+        # grudados ao grupo apenas por proximidade espacial.
+        weak_fragment = (
+            len(chosen) >= 3
+            and line_score < strongest_score * 0.74
+            and (words <= 2 or line.w < 0.18)
+        )
+        if not looks_tiny_auxiliary and not weak_fragment:
             filtered.append(line)
     if filtered:
         chosen = filtered
@@ -1254,13 +1426,22 @@ def read_burned_caption(
     # sem voltar a varrer o cenário inteiro.
     refined_candidates = _refine_caption_region(video_path, timestamps, chosen, lang)
     if refined_candidates:
+        # Não concatena leituras diferentes. O merge textual da V2 podia criar
+        # frases Frankenstein juntando sobras incompatíveis de vários frames.
         candidates = [merged] + refined_candidates
-        refined_merged = _merge_caption_candidates(candidates)
-        best_candidate = max(candidates + [refined_merged], key=_refined_text_score)
-        if _refined_text_score(best_candidate) >= _refined_text_score(merged):
+        best_candidate = _choose_refined_candidate(candidates)
+        if best_candidate and _refined_text_score(best_candidate) >= _refined_text_score(merged) - 6.0:
             merged = best_candidate
+        merged = _repair_caption_edges(merged, refined_candidates)
 
     merged = clean_review_text(re.sub(r"\s+", " ", merged)).strip()
+    # Tesseract costuma enxergar a aspa de fechamento e perder a de abertura
+    # quando ela encosta na primeira letra. Balanceia apenas aspas duplas, sem
+    # inventar pontuação quando nenhuma delas foi reconhecida.
+    if merged.endswith('"') and not merged.startswith('"'):
+        merged = '"' + merged
+    elif merged.startswith('"') and not merged.endswith('"'):
+        merged = merged + '"'
     if not merged:
         return [], ""
 
