@@ -1092,6 +1092,261 @@ def _sample_timestamps(duration: float, max_samples: int) -> list[float]:
 
 
 
+
+def _ocr_prepare_base_gray(frame):
+    """Normaliza o frame exatamente como o OCR global, mas devolve cinza.
+
+    Isso permite reler CADA LINHA da legenda com PSM 7 e múltiplos
+    limiares sem alterar o custo do OCR global. As coordenadas continuam
+    compatíveis com as caixas normalizadas detectadas na primeira passada.
+    """
+    import cv2
+
+    height, width = frame.shape[:2]
+    top = int(height * OCR_CROP_TOP_PERCENT / 100.0)
+    bottom = int(height * (1.0 - OCR_CROP_BOTTOM_PERCENT / 100.0))
+    side = int(width * OCR_CROP_SIDE_PERCENT / 100.0)
+    right = max(side + 2, width - side)
+    bottom = max(top + 2, bottom)
+    frame = frame[top:bottom, side:right]
+
+    height, width = frame.shape[:2]
+    target_width = 1080
+    if width < 820:
+        scale = target_width / max(width, 1)
+        frame = cv2.resize(
+            frame,
+            (target_width, max(2, int(round(height * scale)))),
+            interpolation=cv2.INTER_CUBIC,
+        )
+    elif width > 1280:
+        scale = 1280.0 / width
+        frame = cv2.resize(
+            frame,
+            (1280, max(2, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
+def _ocr_single_line_variants(gray_roi):
+    """Gera variantes fortes para uma linha já localizada.
+
+    O ponto-chave é não aplicar esses limiares no frame inteiro. Depois que
+    a linha persistente foi localizada, podemos ser agressivos sem capturar
+    camiseta, cenário ou watermark. Isso recupera letras de borda e texto
+    branco com contorno (caso clássico: ``Vai`` virar ``A``/``ai``).
+    """
+    import cv2
+
+    if gray_roi is None or getattr(gray_roi, "size", 0) == 0:
+        return []
+
+    # Padding branco evita que PSM 7 encoste a primeira/última letra na borda.
+    pad_y = max(8, int(round(gray_roi.shape[0] * 0.20)))
+    pad_x = max(14, int(round(gray_roi.shape[0] * 0.34)))
+    padded = cv2.copyMakeBorder(
+        gray_roi, pad_y, pad_y, pad_x, pad_x, cv2.BORDER_CONSTANT, value=255
+    )
+
+    clahe = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8)).apply(padded)
+    base_images = [padded, clahe]
+
+    # Limiares fixos são úteis em legendas brancas com contorno preto; Otsu
+    # complementa quando a iluminação muda muito entre vídeos.
+    _, otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    base_images.extend([otsu, 255 - otsu])
+    for threshold in (160, 180, 200, 220):
+        _, binary = cv2.threshold(padded, threshold, 255, cv2.THRESH_BINARY)
+        base_images.extend([binary, 255 - binary])
+
+    variants = []
+    seen = set()
+    for image in base_images:
+        # PSM 7 responde melhor quando a altura da linha é grande.
+        target_h = 180
+        scale = max(1.0, target_h / max(image.shape[0], 1))
+        if scale > 1.05:
+            image = cv2.resize(
+                image,
+                (max(2, int(round(image.shape[1] * scale))), target_h),
+                interpolation=cv2.INTER_CUBIC,
+            )
+        key = (image.shape, int(image.mean()), int(image.std()))
+        if key in seen:
+            continue
+        seen.add(key)
+        variants.append(image)
+    return variants
+
+
+def _clean_line_ocr_text(value: str) -> str:
+    value = clean_review_text(re.sub(r"\s+", " ", value or "")).strip()
+    # Remove somente lixo típico encostado ANTES/DEPOIS da frase. Não mexe em
+    # pontuação interna nem tenta "adivinhar" palavras.
+    value = re.sub(r"^[^A-Za-zÀ-ÿ0-9\"'@#]+", "", value)
+    value = re.sub(r"[^A-Za-zÀ-ÿ0-9?!.,;:\-\"'@#]+$", "", value)
+    return value.strip()
+
+
+def _line_candidate_consensus(candidates: list[str]) -> str:
+    """Escolhe uma leitura por consenso real entre variantes/frames.
+
+    Duplicatas contam como evidência: se ``Vai engolir...`` aparece em vários
+    thresholds e ``A engolir...`` aparece uma vez, a primeira vence. A V4
+    deduplicava cedo demais e perdia exatamente esse sinal.
+    """
+    clean = [_clean_line_ocr_text(item) for item in candidates]
+    clean = [item for item in clean if _ocr_line_quality(item)]
+    if not clean:
+        return ""
+
+    # Agrupa leituras quase iguais. Mantém contagem para transformar repetição
+    # independente em evidência, em vez de tratar cada texto só uma vez.
+    groups: list[dict] = []
+    for item in clean:
+        norm = _normalized_ocr(item)
+        if not norm:
+            continue
+        best_group = None
+        best_sim = 0.0
+        for group in groups:
+            sim = max(
+                _ocr_similarity(norm, group["norm"]),
+                _token_overlap(norm, group["norm"]),
+            )
+            if sim > best_sim:
+                best_sim = sim
+                best_group = group
+        if best_group is not None and best_sim >= 0.86:
+            best_group["items"].append(item)
+            # Representante mais natural/completo dentro do mesmo cluster.
+            if _refined_text_score(item) > _refined_text_score(best_group["text"]):
+                best_group["text"] = item
+                best_group["norm"] = norm
+        else:
+            groups.append({"text": item, "norm": norm, "items": [item]})
+
+    if not groups:
+        return ""
+
+    def score(group: dict) -> float:
+        count = len(group["items"])
+        text = group["text"]
+        # Frequência pesa muito porque todas as variantes olham para a mesma
+        # linha fixa; naturalidade decide empates, não substitui a evidência.
+        return count * 18.0 + _refined_text_score(text)
+
+    winner = max(groups, key=score)
+    return winner["text"]
+
+
+def _refine_caption_lines(
+    video_path: str | Path,
+    timestamps: list[float],
+    chosen: list[_OCRPersistentLine],
+    lang: str,
+) -> list[str]:
+    """Relê cada linha persistente isoladamente usando PSM 7 + ensemble.
+
+    Esta é a etapa de alta precisão da V5. Primeiro o OCR global só LOCALIZA
+    o texto. Depois cada linha é tratada como uma linha de texto conhecida,
+    que é um problema muito mais simples para o Tesseract.
+    """
+    import pytesseract
+
+    if not chosen:
+        return []
+
+    # O OCR esparso pode quebrar UMA linha visual em caixas sobrepostas
+    # (ex.: ``ai eng`` + ``engolir tudo ou você``). Antes da releitura, une
+    # essas caixas pela geometria; assim o PSM 7 recebe a linha inteira.
+    raw_ordered = sorted(chosen, key=lambda line: (line.cy, line.x))
+    rows: list[list[_OCRPersistentLine]] = []
+    for line in raw_ordered:
+        placed = False
+        for row in rows:
+            row_top = min(item.y for item in row)
+            row_bottom = max(item.y + item.h for item in row)
+            overlap = max(0.0, min(row_bottom, line.y + line.h) - max(row_top, line.y))
+            overlap_ratio = overlap / max(1e-6, min(row_bottom - row_top, line.h))
+            row_center = (row_top + row_bottom) / 2.0
+            if overlap_ratio >= 0.28 or abs(line.cy - row_center) <= max(line.h, row_bottom - row_top) * 0.50:
+                row.append(line)
+                placed = True
+                break
+        if not placed:
+            rows.append([line])
+
+    # Converte cada linha visual em uma caixa-union simples.
+    ordered = []
+    for row in rows:
+        x0 = min(item.x for item in row)
+        y0 = min(item.y for item in row)
+        x1 = max(item.x + item.w for item in row)
+        y1 = max(item.y + item.h for item in row)
+        ordered.append(
+            _OCRPersistentLine(
+                text=" ".join(item.text for item in sorted(row, key=lambda i: i.x)),
+                confidence=sum(item.confidence for item in row) / len(row),
+                hits=max(item.hits for item in row),
+                total_samples=max(item.total_samples for item in row),
+                first_sample=min(item.first_sample for item in row),
+                x=x0, y=y0, w=max(1e-6, x1 - x0), h=max(1e-6, y1 - y0),
+            )
+        )
+    ordered.sort(key=lambda line: (line.cy, line.x))
+
+    if len(timestamps) <= 4:
+        selected_times = timestamps
+    else:
+        # Quatro pontos do take reduzem risco de escolher um único frame ruim.
+        indexes = [0, len(timestamps) // 3, (2 * len(timestamps)) // 3, len(timestamps) - 1]
+        selected_times = [timestamps[i] for i in sorted(set(indexes))]
+
+    per_line_candidates: list[list[str]] = [[] for _ in ordered]
+    for timestamp in selected_times:
+        frame = _ocr_grab_frame(video_path, timestamp)
+        if frame is None:
+            continue
+        gray = _ocr_prepare_base_gray(frame)
+        h, w = gray.shape[:2]
+
+        for line_index, line in enumerate(ordered):
+            # Padding proporcional à ALTURA da linha, não à tela inteira. Isso
+            # inclui aspas/primeira letra sem engolir a linha de cima/baixo.
+            px = max(0.012, line.h * 0.65)
+            py = max(0.008, line.h * 0.45)
+            x0 = max(0.0, line.x - px)
+            x1 = min(1.0, line.x + line.w + px)
+            y0 = max(0.0, line.y - py)
+            y1 = min(1.0, line.y + line.h + py)
+
+            left = max(0, min(w - 1, int(round(x0 * w))))
+            right = max(left + 2, min(w, int(round(x1 * w))))
+            top = max(0, min(h - 1, int(round(y0 * h))))
+            bottom = max(top + 2, min(h, int(round(y1 * h))))
+            roi = gray[top:bottom, left:right]
+            if roi.size == 0:
+                continue
+
+            for variant in _ocr_single_line_variants(roi):
+                try:
+                    raw = pytesseract.image_to_string(
+                        variant,
+                        lang=lang,
+                        config="--oem 1 --psm 7 -c preserve_interword_spaces=1",
+                    )
+                except Exception:
+                    continue
+                text = _clean_line_ocr_text(raw)
+                if _ocr_line_quality(text):
+                    per_line_candidates[line_index].append(text)
+
+    winners = [_line_candidate_consensus(items) for items in per_line_candidates]
+    return [winner for winner in winners if winner]
+
 def _refine_caption_region(
     video_path: str | Path,
     timestamps: list[float],
@@ -1444,17 +1699,41 @@ def read_burned_caption(
     merged = clean_review_text(" ".join(line.text.strip() for line in chosen if line.text.strip()))
     merged = re.sub(r"\s+", " ", merged).strip()
 
-    # Segunda passada na região já validada: recupera letras cortadas nas bordas
-    # sem voltar a varrer o cenário inteiro.
+    # V5: depois que a região foi localizada, relê CADA LINHA isoladamente.
+    # PSM 7 + múltiplos thresholds é muito mais confiável para texto fixo
+    # grande com contorno e evita que uma palavra de borda perdida contamine
+    # a frase inteira. A repetição das variantes é usada como evidência.
+    line_winners = _refine_caption_lines(video_path, timestamps, chosen, lang)
+    line_merged = ""
+    if line_winners:
+        line_merged = clean_review_text(" ".join(line_winners)).strip()
+        if _ocr_line_quality(line_merged):
+            # A releitura linha-a-linha só substitui a frase base quando ainda
+            # concorda fortemente com ela. Isso impede que uma segmentação ruim
+            # crie uma frase nova; ao mesmo tempo, permite correções pequenas
+            # como ``A engolir...`` -> ``Vai engolir...``.
+            sim = _ocr_similarity(_normalized_ocr(merged), _normalized_ocr(line_merged))
+            overlap = _token_overlap(merged, line_merged)
+            base_words = max(1, len(_word_tokens(merged)))
+            line_words = len(_word_tokens(line_merged))
+            length_ratio = line_words / base_words
+            safe_shape = 0.72 <= length_ratio <= 1.35
+            if (sim >= 0.78 or overlap >= 0.80) and safe_shape:
+                if _refined_text_score(line_merged) >= _refined_text_score(merged) - 2.0:
+                    merged = line_merged
+
+    # A leitura da região inteira continua como apoio/fallback para casos em
+    # que uma frase visual foi quebrada em caixas incomuns pelo OCR global.
     refined_candidates = _refine_caption_region(video_path, timestamps, chosen, lang)
     if refined_candidates:
-        # Não concatena leituras diferentes. O merge textual da V2 podia criar
-        # frases Frankenstein juntando sobras incompatíveis de vários frames.
         candidates = [merged] + refined_candidates
         best_candidate = _choose_refined_candidate(candidates)
-        if best_candidate and _refined_text_score(best_candidate) >= _refined_text_score(merged) - 6.0:
+        # Na V5, a leitura linha-a-linha tem prioridade. Só trocamos por uma
+        # leitura global quando ela é claramente melhor, não apenas parecida.
+        if best_candidate and _refined_text_score(best_candidate) > _refined_text_score(merged) + 8.0:
             merged = best_candidate
-        merged = _repair_caption_edges(merged, refined_candidates)
+        edge_candidates = ([line_merged] if line_merged else []) + refined_candidates
+        merged = _repair_caption_edges(merged, edge_candidates)
 
     merged = clean_review_text(re.sub(r"\s+", " ", merged)).strip()
     # Tesseract costuma enxergar a aspa de fechamento e perder a de abertura
