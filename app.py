@@ -91,7 +91,7 @@ def caption_review_visibility(choice: str):
             "Método alterado. Clique em **Reanalisar** para aplicar ao vídeo atual.")
 
 
-def importar_video_url(url: str) -> str:
+def importar_video_url(url: str, permitir_sem_audio: bool = False) -> str:
     if not (url or "").strip():
         raise gr.Error("Cole um link válido do Instagram.")
     cleanup_old_jobs()
@@ -100,6 +100,7 @@ def importar_video_url(url: str) -> str:
         caminho, _ = url_import.baixar_video(
             url=url.strip(), pasta_destino=str(WORK_ROOT),
             identificador=job_id, limite_mb=MAX_INSTAGRAM_DOWNLOAD_MB,
+            permitir_sem_audio=permitir_sem_audio,
         )
         _validate_original(caminho)
         return caminho
@@ -109,10 +110,10 @@ def importar_video_url(url: str) -> str:
         raise gr.Error(f"Não foi possível importar esse vídeo: {exc}") from exc
 
 
-def handle_url_import(url: str):
-    caminho = importar_video_url(url)
+def handle_url_import(url: str, permitir_sem_audio: bool):
+    caminho = importar_video_url(url, permitir_sem_audio)
     info = _validate_original(caminho)
-    audio_status = "🔊 Faixa de áudio detectada" if info.has_audio else "⚠️ SEM ÁUDIO NO ARQUIVO IMPORTADO — não será possível preservar o som"
+    audio_status = "🔊 Faixa de áudio detectada" if info.has_audio else "⚠️ VÍDEO SEM ÁUDIO — anexe uma faixa em Recuperar áudio antes de gerar"
     return (f"✅ Importado: **{info.duration:.1f}s** · {info.width}×{info.height} · {audio_status}. Analisando...",
             caminho, gr.update(value="Detectar automaticamente"), gr.update(value=None, visible=False))
 
@@ -123,7 +124,7 @@ def handle_local_video(path: str | None):
                 gr.update(value=None, visible=False))
     try:
         info = _validate_original(path)
-        audio_status = "🔊 Faixa de áudio detectada" if info.has_audio else "⚠️ SEM ÁUDIO NO ARQUIVO ENVIADO — não será possível preservar o som"
+        audio_status = "🔊 Faixa de áudio detectada" if info.has_audio else "⚠️ VÍDEO SEM ÁUDIO — anexe uma faixa em Recuperar áudio antes de gerar"
         return (f"✅ Enviado: **{info.duration:.1f}s** · {info.width}×{info.height} · {audio_status}. Analisando...",
                 path, gr.update(value="Detectar automaticamente"), gr.update(value=None, visible=False))
     except MediaError as exc:
@@ -300,7 +301,7 @@ def preview_image(intro_media_path, analysis_state, reviewed_text, caption_sourc
 def generate_final(intro_media_path, video_path, analysis_state, caption_timings,
                    reviewed_text, caption_source, transition_mode, manual_transition_seconds,
                    continuation_fit_mode, caption_position, caption_font_percent,
-                   language_label, quality_profile, progress=gr.Progress()):
+                   language_label, quality_profile, audio_recovery_path, progress=gr.Progress()):
     if not intro_media_path or not video_path:
         raise gr.Error("Adicione o original e a nova mídia antes de gerar.")
     if not analysis_state or analysis_state.get("video_path") != video_path:
@@ -331,6 +332,7 @@ def generate_final(intro_media_path, video_path, analysis_state, caption_timings
             language=_language_code(language_label), caption_events_override=list(caption_timings or []),
             progress=lambda value, description: progress(value, desc=description),
             quality_profile=quality_profile,
+            audio_recovery_path=audio_recovery_path,
         )
     except MediaError as exc:
         raise gr.Error(str(exc)) from exc
@@ -343,13 +345,13 @@ def generate_final(intro_media_path, video_path, analysis_state, caption_timings
 def reset_project():
     return (None, "", "", None, "Envie o vídeo original para começar.", "", [], None,
             None, None, "", None, None, "", QUALITY_STANDARD, "Copiar texto escrito no vídeo",
-            "Detectar automaticamente", gr.update(value=None, visible=False))
+            "Detectar automaticamente", gr.update(value=None, visible=False), False, None)
 
 
 with gr.Blocks(title="Studio Reels | Editor de vídeo", analytics_enabled=False) as demo:
     gr.HTML("""
     <header id="studio-header">
-      <div class="eyebrow">STUDIO REELS · VERSÃO 2.0.1</div>
+      <div class="eyebrow">STUDIO REELS · VERSÃO 2.0.3</div>
       <h1>Crie seu vídeo em poucos passos.</h1>
       <p>Importe o original, escolha a nova mídia, revise o texto e exporte.<br>
          Sem configurações complicadas nem renderizações desnecessárias.</p>
@@ -370,9 +372,23 @@ with gr.Blocks(title="Studio Reels | Editor de vídeo", analytics_enabled=False)
                     with gr.Tab("Importar link"):
                         video_url = gr.Textbox(label="Link do Instagram", placeholder="https://www.instagram.com/reel/...", lines=1)
                         import_button = gr.Button("Importar e analisar", variant="primary", elem_id="import-btn")
+                        permitir_sem_audio = gr.Checkbox(
+                            label="Usar uma faixa de áudio separada se o Instagram não fornecer som",
+                            value=False,
+                            info="Ative somente se a importação comum falhou sem áudio. Será obrigatório anexar o áudio antes da exportação.",
+                        )
                     with gr.Tab("Enviar arquivo"):
                         local_video = gr.File(label="Arquivo MP4 ou outro vídeo", file_types=["video"], type="filepath")
                 import_status = gr.Markdown("Envie o vídeo original para começar.")
+                with gr.Accordion("Recuperar áudio — caso o Instagram importe sem som", open=False):
+                    audio_recovery = gr.File(
+                        label="Faixa de áudio autorizada (MP3, M4A, WAV ou MP4 com som)",
+                        file_types=["audio", "video"], type="filepath",
+                    )
+                    gr.Markdown(
+                        "O áudio deve cobrir toda a duração do Reel e começa no segundo 0. "
+                        "Se o arquivo original já tiver som, ele será preservado e este anexo será ignorado."
+                    )
 
             with gr.Group(elem_classes=["studio-panel"]):
                 gr.HTML('<div class="studio-section"><span class="studio-index">02</span> Personalizar</div>'
@@ -434,7 +450,7 @@ with gr.Blocks(title="Studio Reels | Editor de vídeo", analytics_enabled=False)
                         analysis_state, transition_mode, manual_transition]
     analysis_inputs = [video_path_state, caption_source, language, transition_mode, manual_transition]
 
-    import_button.click(handle_url_import, video_url, [import_status, video_path_state,
+    import_button.click(handle_url_import, [video_url, permitir_sem_audio], [import_status, video_path_state,
                                                          transition_mode, manual_transition],
                         api_visibility="private").success(auto_analyze, analysis_inputs, analysis_outputs,
                                                           api_visibility="private")
@@ -463,7 +479,7 @@ with gr.Blocks(title="Studio Reels | Editor de vídeo", analytics_enabled=False)
         generate_final,
         inputs=[intro_media, video_path_state, analysis_state, caption_timings_state,
                 reviewed_text, caption_source, transition_mode, manual_transition,
-                continuation_fit, caption_position, caption_size, language, quality_profile],
+                continuation_fit, caption_position, caption_size, language, quality_profile, audio_recovery],
         outputs=[output_video, download_output, report],
         api_visibility="private", concurrency_limit=1, concurrency_id="render",
     )
@@ -472,7 +488,8 @@ with gr.Blocks(title="Studio Reels | Editor de vídeo", analytics_enabled=False)
         outputs=[local_video, video_url, import_status, video_path_state, analysis_result,
                  reviewed_text, caption_timings_state, analysis_state, intro_media,
                  preview_output, preview_status, output_video, download_output,
-                 report, quality_profile, caption_source, transition_mode, manual_transition],
+                 report, quality_profile, caption_source, transition_mode, manual_transition,
+                 permitir_sem_audio, audio_recovery],
         api_visibility="private",
     )
 
@@ -488,7 +505,7 @@ def health():
 
 @fastapi_app.get("/api/info")
 def api_info():
-    return {"name": "Studio Reels 2.0", "status": "online", "preview": True,
+    return {"name": "Studio Reels 2.0.3", "status": "online", "preview": True,
             "url_import": True, "api_import_enabled": bool(os.getenv("IMPORT_API_TOKEN", ""))}
 
 
