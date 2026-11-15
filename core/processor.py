@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import shutil
 import time
 import uuid
@@ -233,6 +234,8 @@ def _build_filter_complex(
     fit_mode: str,
     caption_overlays: list[CaptionOverlay],
     has_audio: bool,
+    audio_input_index: int = 1,
+    caption_input_start: int = 2,
 ) -> tuple[str, str, str | None]:
     fps_text = f"{fps:.6f}".rstrip("0").rstrip(".")
     chains: list[str] = []
@@ -247,7 +250,7 @@ def _build_filter_complex(
 
     intro_label = "introbase"
     for index, overlay in enumerate(caption_overlays):
-        input_index = 2 + index
+        input_index = caption_input_start + index
         source_label = f"caption{index}src"
         output_label = f"introcaption{index}"
         chains.append(f"[{input_index}:v]format=rgba[{source_label}]")
@@ -270,8 +273,8 @@ def _build_filter_complex(
     intro_label = "introready"
 
     if has_continuation:
-        # Áudio original é mantido integralmente. Corte de vídeo no mesmo
-        # instante da troca evita o descompasso de 70 ms da versão anterior.
+        # O áudio é mantido durante todos os takes; o vídeo da continuação
+        # é cortado exatamente na transição para evitar dessincronização.
         chains.append(
             f"[1:v]trim=start={transition:.6f},setpts=PTS-STARTPTS[contsrc]"
         )
@@ -283,7 +286,10 @@ def _build_filter_complex(
 
     audio_label: str | None = None
     if has_audio:
-        chains.append("[1:a:0]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[aout]")
+        chains.append(
+            f"[{audio_input_index}:a:0]asetpts=PTS-STARTPTS,"
+            f"aresample=async=1:first_pts=0[aout]"
+        )
         audio_label = "aout"
 
     return ";".join(chains), "vout", audio_label
@@ -329,6 +335,34 @@ def _caption_events_from_override(
     return [CaptionEvent(0.0, max(0.15, duration), cleaned)]
 
 
+def _validar_audio_externo(audio_path: str, duracao_video: float) -> None:
+    """Valida uma faixa de áudio separada, sem re-encodar nem tocar mídia na etapa de upload."""
+    arquivo = Path(audio_path)
+    if not arquivo.is_file():
+        raise MediaError("O arquivo de áudio de recuperação não foi encontrado.")
+    if arquivo.stat().st_size > 200 * 1024 * 1024:
+        raise MediaError("O áudio de recuperação excede 200 MB.")
+    cmd = [
+        require_binary("ffprobe"), "-v", "error", "-show_streams",
+        "-show_format", "-of", "json", str(arquivo),
+    ]
+    try:
+        data = json.loads(run_command(cmd, timeout=60).stdout)
+        faixas = data.get("streams", [])
+        if not any(s.get("codec_type") == "audio" for s in faixas):
+            raise MediaError("O arquivo de recuperação não contém uma faixa de áudio.")
+        duracao = float(data.get("format", {}).get("duration", "0"))
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise MediaError("Não foi possível verificar a duração do áudio adicional.") from exc
+    if not math.isfinite(duracao) or duracao <= 0:
+        raise MediaError("O áudio de recuperação possui duração inválida.")
+    if duracao < duracao_video - 0.1:
+        raise MediaError(
+            f"O áudio de recuperação tem {duracao:.1f}s e o vídeo tem {duracao_video:.1f}s. "
+            "Envie uma faixa que cubra toda a duração do vídeo."
+        )
+
+
 def process_video(
     *,
     photo_path: str,
@@ -344,6 +378,7 @@ def process_video(
     caption_events_override: list[dict] | None = None,
     progress: ProgressFn | None = None,
     quality_profile: str = QUALITY_STANDARD,
+    audio_recovery_path: str | None = None,
 ) -> ProcessResult:
     """Gera o vídeo final. ``photo_path`` aceita imagem ou vídeo por compatibilidade de API."""
 
@@ -357,26 +392,30 @@ def process_video(
     if not video_path:
         raise MediaError("Envie o vídeo original com áudio e, quando existir, o trecho de continuação.")
 
-    job_dir = WORK_ROOT / uuid.uuid4().hex
-    job_dir.mkdir(parents=True, exist_ok=False)
-    output_path = job_dir / "video_pronto.mp4"
-    normalized_intro_path = job_dir / "primeiro_take_normalizado.mp4"
-
     _safe_progress(progress, 0.04, "Lendo os arquivos...")
     info = probe_video(video_path)
     if info.duration <= 0:
         raise MediaError("A duração do vídeo original é inválida.")
-    if not info.has_audio:
+    recuperar_audio = not info.has_audio and bool(audio_recovery_path)
+    if not info.has_audio and not recuperar_audio:
         raise MediaError(
-            "O vídeo original recebido não contém faixa de áudio. "
-            "Não é possível preservar um som que não veio no arquivo. "
-            "Baixe o Reels com áudio e envie o MP4 original novamente."
+            "O vídeo original não contém faixa de áudio. Na seção 'Recuperar áudio', "
+            "envie um arquivo de áudio com a mesma duração do Reel, "
+            "ou envie o original em MP4 com som."
         )
+    if recuperar_audio:
+        _validar_audio_externo(str(audio_recovery_path), info.duration)
     if info.duration > MAX_VIDEO_MINUTES * 60:
         raise MediaError(
             f"O vídeo original tem {info.duration / 60:.1f} minutos. O limite configurado é "
             f"{MAX_VIDEO_MINUTES:.0f} minutos."
         )
+
+    # Não cria diretórios temporários antes de validar o original e o áudio.
+    job_dir = WORK_ROOT / uuid.uuid4().hex
+    job_dir.mkdir(parents=True, exist_ok=False)
+    output_path = job_dir / "video_pronto.mp4"
+    normalized_intro_path = job_dir / "primeiro_take_normalizado.mp4"
 
     output_w, output_h, output_fps, output_crf, output_bitrate = export_settings(
         info.width, info.height, info.fps, quality_profile
@@ -478,7 +517,9 @@ def process_video(
         has_continuation=has_continuation,
         fit_mode=continuation_fit_mode,
         caption_overlays=caption_overlays,
-        has_audio=info.has_audio,
+        has_audio=True,
+        audio_input_index=2 if recuperar_audio else 1,
+        caption_input_start=3 if recuperar_audio else 2,
     )
 
     ffmpeg = require_binary("ffmpeg")
@@ -497,6 +538,8 @@ def process_video(
     # permanece exclusivamente no input 1 e só é usado após a transição.
     command.extend(["-i", str(normalized_intro_path)])
     command.extend(["-i", str(video_path)])
+    if recuperar_audio:
+        command.extend(["-i", str(audio_recovery_path)])
     for overlay in caption_overlays:
         command.extend([
             "-loop",
@@ -548,7 +591,7 @@ def process_video(
 
     _safe_progress(progress, 0.96, "Validando o vídeo final...")
     final_info = probe_video(output_path)
-    if info.has_audio and not final_info.has_audio:
+    if not final_info.has_audio:
         # Nunca anunciar sucesso caso a saída tenha perdido a faixa do original.
         output_path.unlink(missing_ok=True)
         raise MediaError(
@@ -595,13 +638,18 @@ def process_video(
     if transcript_summary:
         transcript_line = f"\n\n**Transcrição identificada**\n{transcript_summary.strip()}"
 
+    audio_report = (
+        "Áudio de recuperação enviado pelo usuário, confirmado no MP4 final"
+        if recuperar_audio else
+        "Áudio original detectado e confirmado no MP4 final"
+    )
     report = (
         "### Vídeo gerado\n"
         f"- Saída: {final_info.width}×{final_info.height}, {final_info.fps:.2f} FPS, "
         f"{final_info.duration:.2f}s.\n"
         f"{media_line}\n"
         f"{structure_line}\n"
-        f"- Áudio original: faixa detectada no original e confirmada no MP4 final (AAC, {output_bitrate})."
+        f"- Áudio: {audio_report} (AAC, {output_bitrate})."
         f"{loop_line}{detection_line}{size_note}{transcript_line}"
     )
 
