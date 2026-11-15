@@ -112,7 +112,8 @@ def importar_video_url(url: str) -> str:
 def handle_url_import(url: str):
     caminho = importar_video_url(url)
     info = _validate_original(caminho)
-    return (f"✅ Importado: **{info.duration:.1f}s** · {info.width}×{info.height}. Analisando...",
+    audio_status = "🔊 Faixa de áudio detectada" if info.has_audio else "⚠️ SEM ÁUDIO NO ARQUIVO IMPORTADO — não será possível preservar o som"
+    return (f"✅ Importado: **{info.duration:.1f}s** · {info.width}×{info.height} · {audio_status}. Analisando...",
             caminho, gr.update(value="Detectar automaticamente"), gr.update(value=None, visible=False))
 
 
@@ -122,7 +123,8 @@ def handle_local_video(path: str | None):
                 gr.update(value=None, visible=False))
     try:
         info = _validate_original(path)
-        return (f"✅ Enviado: **{info.duration:.1f}s** · {info.width}×{info.height}. Analisando...",
+        audio_status = "🔊 Faixa de áudio detectada" if info.has_audio else "⚠️ SEM ÁUDIO NO ARQUIVO ENVIADO — não será possível preservar o som"
+        return (f"✅ Enviado: **{info.duration:.1f}s** · {info.width}×{info.height} · {audio_status}. Analisando...",
                 path, gr.update(value="Detectar automaticamente"), gr.update(value=None, visible=False))
     except MediaError as exc:
         raise gr.Error(str(exc)) from exc
@@ -214,7 +216,11 @@ def analyze_source(video_path, caption_source, language_label,
         "caption_source": caption_source, "source_width": info.width,
         "source_height": info.height, "source_fps": info.fps,
     }
-    details = f"✅ **Análise concluída.** {message} {note}"
+    audio_note = "🔊 Áudio original detectado." if info.has_audio else (
+        "⚠️ **O arquivo original está sem faixa de áudio.** "
+        "Para gerar um vídeo com som, importe outro arquivo com áudio."
+    )
+    details = f"✅ **Análise concluída.** {message} {audio_note} {note}"
     if summary and caption_source in {"Copiar texto escrito no vídeo", "Transcrever o áudio"}:
         line = summary.splitlines()[0] if summary.splitlines() else ""
         if line:
@@ -343,7 +349,7 @@ def reset_project():
 with gr.Blocks(title="Studio Reels | Editor de vídeo", analytics_enabled=False) as demo:
     gr.HTML("""
     <header id="studio-header">
-      <div class="eyebrow">STUDIO REELS · VERSÃO 2.0</div>
+      <div class="eyebrow">STUDIO REELS · VERSÃO 2.0.1</div>
       <h1>Crie seu vídeo em poucos passos.</h1>
       <p>Importe o original, escolha a nova mídia, revise o texto e exporte.<br>
          Sem configurações complicadas nem renderizações desnecessárias.</p>
