@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-APP_NAME = "Studio Reels 2.0"
+APP_NAME = "Mídia + Vídeo Automático"
 WORK_ROOT = Path(os.getenv("WORK_ROOT", "/tmp/foto_video_saas"))
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -14,7 +14,7 @@ DEFAULT_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "pt")
 WHISPER_KEEP_MODEL_LOADED = os.getenv("WHISPER_KEEP_MODEL_LOADED", "0").strip() == "1"
 
 MAX_VIDEO_MINUTES = float(os.getenv("MAX_VIDEO_MINUTES", "10"))
-MAX_INSTAGRAM_DOWNLOAD_MB = max(1, int(os.getenv("MAX_INSTAGRAM_DOWNLOAD_MB", "200")))
+MAX_INSTAGRAM_DOWNLOAD_MB = max(1, int(os.getenv("MAX_INSTAGRAM_DOWNLOAD_MB", "500")))
 OUTPUT_CRF = int(os.getenv("OUTPUT_CRF", "21"))
 OUTPUT_PRESET = os.getenv("OUTPUT_PRESET", "veryfast")
 OUTPUT_AUDIO_BITRATE = os.getenv("OUTPUT_AUDIO_BITRATE", "160k")
