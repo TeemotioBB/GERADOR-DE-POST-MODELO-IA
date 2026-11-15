@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 
 import yt_dlp
 
-from .media import MediaError, probe_video
+from .media import MediaError, has_audible_audio, probe_video
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +196,8 @@ def _validar_arquivo_com_audio(arquivo: Path | None, limite_bytes: int, limite_m
         info = probe_video(arquivo)
     except (MediaError, ValueError, OSError) as exc:
         raise InstagramImportError("O Instagram retornou um arquivo de vídeo inválido.") from exc
-    if not info.has_audio and not aceitar_sem_audio:
+    # Faixa presente porém muda (comum em falhas do Instagram/yt-dlp) = sem áudio.
+    if not aceitar_sem_audio and not (info.has_audio and has_audible_audio(arquivo)):
         raise InstagramImportError(
             "O Instagram retornou apenas a imagem do Reel, sem a faixa de áudio."
         )
