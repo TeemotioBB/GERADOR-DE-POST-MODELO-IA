@@ -13,8 +13,9 @@ VideoImportError = InstagramImportError
 
 
 def baixar_video(url: str, pasta_destino: str, identificador: str,
-                 limite_mb: int = 200) -> tuple[str, str]:
+                 limite_mb: int = 200, permitir_sem_audio: bool = False) -> tuple[str, str]:
     return baixar_video_instagram(
         url=url, pasta_destino=pasta_destino,
         identificador=identificador, limite_mb=limite_mb,
+        permitir_sem_audio=permitir_sem_audio,
     )
