@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import math
-import json
 import shutil
 import time
 import uuid
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -29,31 +27,10 @@ from .config import (
     TEMP_MAX_AGE_HOURS,
     WORK_ROOT,
 )
-from .media import MediaError, PreparedIntroMedia, has_audible_audio, prepare_intro_media, probe_video, require_binary, run_command, scaled_even_dimensions
+from .media import MediaError, PreparedIntroMedia, prepare_intro_media, probe_video, require_binary, run_command
 from .transition import TransitionResult, detect_intro_end
 
 ProgressFn = Callable[[float, str], None]
-logger = logging.getLogger(__name__)
-
-
-# Perfis definidos no servidor, nunca aceitos como parâmetros de FFmpeg arbitrários.
-QUALITY_STANDARD = "Padrão (1080p)"
-QUALITY_ECONOMY = "Econômico (720p)"
-
-
-def export_settings(source_width: int, source_height: int, source_fps: float,
-                    quality_profile: str = QUALITY_STANDARD) -> tuple[int, int, float, int, str]:
-    """Preserva o formato do vídeo original; limita resolução/fps/custo por perfil."""
-    if quality_profile not in {QUALITY_STANDARD, QUALITY_ECONOMY}:
-        raise MediaError("Escolha um perfil de exportação válido.")
-    requested_edge = 1280 if quality_profile == QUALITY_ECONOMY else 1920
-    cap = min(requested_edge, OUTPUT_MAX_LONG_EDGE) if OUTPUT_MAX_LONG_EDGE else requested_edge
-    width, height = scaled_even_dimensions(source_width, source_height, cap)
-    fps = min(source_fps, 30.0)  # reduz render de 60fps a 30fps, suficiente para o modo econômico
-    crf = 23 if quality_profile == QUALITY_ECONOMY else OUTPUT_CRF
-    bitrate = "128k" if quality_profile == QUALITY_ECONOMY else OUTPUT_AUDIO_BITRATE
-    return width, height, fps, crf, bitrate
-
 
 
 @dataclass(frozen=True)
@@ -63,16 +40,8 @@ class ProcessResult:
     transition_seconds: float
 
 
-_last_cleanup = 0.0
-
-
-def cleanup_old_jobs(*, force: bool = False) -> None:
-    """Limpeza oportunista: sem thread, timer ou tráfego que mantenha o Railway ativo."""
-    global _last_cleanup
-    now = time.monotonic()
-    if not force and now - _last_cleanup < 900:
-        return
-    _last_cleanup = now
+def cleanup_old_jobs() -> None:
+    """Apaga jobs, previews e imports antigos do diretório temporário."""
     cutoff = time.time() - TEMP_MAX_AGE_HOURS * 3600
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     for item in WORK_ROOT.iterdir():
@@ -85,23 +54,6 @@ def cleanup_old_jobs(*, force: bool = False) -> None:
                 item.unlink(missing_ok=True)
         except OSError:
             continue
-
-    # Uploads e prévias também passam pelo cache interno do Gradio. Removê-los
-    # somente em eventos de uso, sem timers, para permitir Railway Serverless.
-    import os
-    cache_root = Path(os.getenv("GRADIO_TEMP_DIR", "/tmp/gradio"))
-    if cache_root.is_dir():
-        cache_hours = max(2.0, float(os.getenv("GRADIO_CACHE_MAX_AGE_HOURS", "6")))
-        cache_cutoff = time.time() - 3600 * cache_hours
-        for item in cache_root.iterdir():
-            try:
-                if item.stat().st_mtime < cache_cutoff:
-                    if item.is_dir():
-                        shutil.rmtree(item, ignore_errors=True)
-                    else:
-                        item.unlink(missing_ok=True)
-            except OSError:
-                continue
 
 
 def _safe_progress(progress: ProgressFn | None, value: float, description: str) -> None:
@@ -234,8 +186,6 @@ def _build_filter_complex(
     fit_mode: str,
     caption_overlays: list[CaptionOverlay],
     has_audio: bool,
-    audio_input_index: int = 1,
-    caption_input_start: int = 2,
 ) -> tuple[str, str, str | None]:
     fps_text = f"{fps:.6f}".rstrip("0").rstrip(".")
     chains: list[str] = []
@@ -250,7 +200,7 @@ def _build_filter_complex(
 
     intro_label = "introbase"
     for index, overlay in enumerate(caption_overlays):
-        input_index = caption_input_start + index
+        input_index = 2 + index
         source_label = f"caption{index}src"
         output_label = f"introcaption{index}"
         chains.append(f"[{input_index}:v]format=rgba[{source_label}]")
@@ -273,10 +223,14 @@ def _build_filter_complex(
     intro_label = "introready"
 
     if has_continuation:
-        # O áudio é mantido durante todos os takes; o vídeo da continuação
-        # é cortado exatamente na transição para evitar dessincronização.
+        # Margem de segurança de ~2 quadros: vídeos de celular (VFR) podem ter
+        # timestamps levemente imprecisos e deixar 1-2 quadros da cena antiga
+        # "vazarem" no início da continuação. Pular 0.07s do vídeo original a
+        # partir da troca elimina isso sem efeito visível no take de continuação.
+        safety_margin = 0.07
+        continuation_start = min(transition + safety_margin, max(transition, duration - 0.05))
         chains.append(
-            f"[1:v]trim=start={transition:.6f},setpts=PTS-STARTPTS[contsrc]"
+            f"[1:v]trim=start={continuation_start:.6f},setpts=PTS-STARTPTS[contsrc]"
         )
         fit_chain, cont_label = _fit_filter("contsrc", width, height, fps, fit_mode)
         chains.append(fit_chain)
@@ -286,10 +240,7 @@ def _build_filter_complex(
 
     audio_label: str | None = None
     if has_audio:
-        chains.append(
-            f"[{audio_input_index}:a:0]asetpts=PTS-STARTPTS,"
-            f"aresample=async=1:first_pts=0[aout]"
-        )
+        chains.append("[1:a:0]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[aout]")
         audio_label = "aout"
 
     return ";".join(chains), "vout", audio_label
@@ -335,34 +286,6 @@ def _caption_events_from_override(
     return [CaptionEvent(0.0, max(0.15, duration), cleaned)]
 
 
-def _validar_audio_externo(audio_path: str, duracao_video: float) -> None:
-    """Valida uma faixa de áudio separada, sem re-encodar nem tocar mídia na etapa de upload."""
-    arquivo = Path(audio_path)
-    if not arquivo.is_file():
-        raise MediaError("O arquivo de áudio de recuperação não foi encontrado.")
-    if arquivo.stat().st_size > 200 * 1024 * 1024:
-        raise MediaError("O áudio de recuperação excede 200 MB.")
-    cmd = [
-        require_binary("ffprobe"), "-v", "error", "-show_streams",
-        "-show_format", "-of", "json", str(arquivo),
-    ]
-    try:
-        data = json.loads(run_command(cmd, timeout=60).stdout)
-        faixas = data.get("streams", [])
-        if not any(s.get("codec_type") == "audio" for s in faixas):
-            raise MediaError("O arquivo de recuperação não contém uma faixa de áudio.")
-        duracao = float(data.get("format", {}).get("duration", "0"))
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise MediaError("Não foi possível verificar a duração do áudio adicional.") from exc
-    if not math.isfinite(duracao) or duracao <= 0:
-        raise MediaError("O áudio de recuperação possui duração inválida.")
-    if duracao < duracao_video - 0.1:
-        raise MediaError(
-            f"O áudio de recuperação tem {duracao:.1f}s e o vídeo tem {duracao_video:.1f}s. "
-            "Envie uma faixa que cubra toda a duração do vídeo."
-        )
-
-
 def process_video(
     *,
     photo_path: str,
@@ -377,12 +300,9 @@ def process_video(
     language: str,
     caption_events_override: list[dict] | None = None,
     progress: ProgressFn | None = None,
-    quality_profile: str = QUALITY_STANDARD,
-    audio_recovery_path: str | None = None,
 ) -> ProcessResult:
     """Gera o vídeo final. ``photo_path`` aceita imagem ou vídeo por compatibilidade de API."""
 
-    started_at = time.monotonic()
     cleanup_old_jobs()
     require_binary("ffmpeg")
     require_binary("ffprobe")
@@ -392,47 +312,31 @@ def process_video(
     if not video_path:
         raise MediaError("Envie o vídeo original com áudio e, quando existir, o trecho de continuação.")
 
+    job_dir = WORK_ROOT / uuid.uuid4().hex
+    job_dir.mkdir(parents=True, exist_ok=False)
+    output_path = job_dir / "video_pronto.mp4"
+    normalized_intro_path = job_dir / "primeiro_take_normalizado.mp4"
+
     _safe_progress(progress, 0.04, "Lendo os arquivos...")
     info = probe_video(video_path)
     if info.duration <= 0:
         raise MediaError("A duração do vídeo original é inválida.")
-    # Faixa que existe mas é muda conta como "sem áudio": o ffprobe sozinho não percebe.
-    original_audivel = info.has_audio and has_audible_audio(video_path)
-    recuperar_audio = not original_audivel and bool(audio_recovery_path)
-    if not original_audivel and not recuperar_audio:
-        motivo = (
-            "O vídeo original tem uma faixa de áudio, mas ela está MUDA (silêncio total)."
-            if info.has_audio else "O vídeo original não contém faixa de áudio."
-        )
-        raise MediaError(
-            f"{motivo} Na seção 'Recuperar áudio', envie um arquivo de áudio com a mesma "
-            "duração do Reel, ou envie o original em MP4 com som."
-        )
-    if recuperar_audio:
-        _validar_audio_externo(str(audio_recovery_path), info.duration)
     if info.duration > MAX_VIDEO_MINUTES * 60:
         raise MediaError(
             f"O vídeo original tem {info.duration / 60:.1f} minutos. O limite configurado é "
             f"{MAX_VIDEO_MINUTES:.0f} minutos."
         )
 
-    # Não cria diretórios temporários antes de validar o original e o áudio.
-    job_dir = WORK_ROOT / uuid.uuid4().hex
-    job_dir.mkdir(parents=True, exist_ok=False)
-    output_path = job_dir / "video_pronto.mp4"
-    normalized_intro_path = job_dir / "primeiro_take_normalizado.mp4"
-
-    output_w, output_h, output_fps, output_crf, output_bitrate = export_settings(
-        info.width, info.height, info.fps, quality_profile
-    )
     intro_media = prepare_intro_media(
         photo_path,
         job_dir,
-        max_long_edge=max(output_w, output_h),
+        max_long_edge=OUTPUT_MAX_LONG_EDGE,
     )
     if intro_media.kind == "video" and (intro_media.duration or 0) <= 0:
         raise MediaError("O vídeo enviado como mídia inicial possui duração inválida.")
 
+    output_w = intro_media.output_width
+    output_h = intro_media.output_height
 
     _safe_progress(progress, 0.16, "Identificando onde termina o primeiro take...")
     transition, detection, has_continuation = _resolve_transition(
@@ -508,7 +412,7 @@ def process_video(
         normalized_intro_path,
         width=output_w,
         height=output_h,
-        fps=output_fps,
+        fps=info.fps,
         duration=intro_duration,
     )
 
@@ -516,15 +420,13 @@ def process_video(
     filter_complex, video_label, audio_label = _build_filter_complex(
         width=output_w,
         height=output_h,
-        fps=output_fps,
+        fps=info.fps,
         duration=info.duration,
         transition=transition,
         has_continuation=has_continuation,
         fit_mode=continuation_fit_mode,
         caption_overlays=caption_overlays,
-        has_audio=True,
-        audio_input_index=2 if recuperar_audio else 1,
-        caption_input_start=3 if recuperar_audio else 2,
+        has_audio=info.has_audio,
     )
 
     ffmpeg = require_binary("ffmpeg")
@@ -543,14 +445,12 @@ def process_video(
     # permanece exclusivamente no input 1 e só é usado após a transição.
     command.extend(["-i", str(normalized_intro_path)])
     command.extend(["-i", str(video_path)])
-    if recuperar_audio:
-        command.extend(["-i", str(audio_recovery_path)])
     for overlay in caption_overlays:
         command.extend([
             "-loop",
             "1",
             "-framerate",
-            f"{output_fps:.6f}",
+            f"{info.fps:.6f}",
             "-i",
             overlay.path,
         ])
@@ -574,7 +474,7 @@ def process_video(
             "-preset",
             OUTPUT_PRESET,
             "-crf",
-            str(output_crf),
+            str(OUTPUT_CRF),
             "-pix_fmt",
             "yuv420p",
             "-threads",
@@ -584,7 +484,7 @@ def process_video(
         ]
     )
     if audio_label:
-        command.extend(["-c:a", "aac", "-b:a", output_bitrate])
+        command.extend(["-c:a", "aac", "-b:a", OUTPUT_AUDIO_BITRATE])
     else:
         command.append("-an")
     command.extend(["-max_muxing_queue_size", "2048", str(output_path)])
@@ -596,14 +496,6 @@ def process_video(
 
     _safe_progress(progress, 0.96, "Validando o vídeo final...")
     final_info = probe_video(output_path)
-    if not final_info.has_audio or not has_audible_audio(output_path):
-        # Nunca anunciar sucesso caso a saída tenha perdido a faixa do original.
-        output_path.unlink(missing_ok=True)
-        raise MediaError(
-            "A exportação terminou, mas o MP4 final está sem áudio audível (faixa "
-            "ausente ou muda). O vídeo foi rejeitado para evitar "
-            "um download sem som. Tente novamente ou envie o arquivo original."
-        )
 
     detection_line = ""
     if detection:
@@ -634,40 +526,31 @@ def process_video(
                 f"{intro_duration:.2f}s para coincidir com a troca do take."
             )
 
-    size_note = (
-        f"\n- Formato de saída baseado no original: {output_w}×{output_h}, "
-        "adaptando a nova mídia com margens pretas quando necessário."
-    )
+    size_note = ""
+    if max(intro_media.original_width, intro_media.original_height) > max(output_w, output_h) + 1:
+        size_note = (
+            f"\n- Resolução otimizada: a mídia era {intro_media.original_width}×{intro_media.original_height}; "
+            f"a saída ficou {output_w}×{output_h}, preservando a proporção."
+        )
+    elif (intro_media.original_width, intro_media.original_height) != (output_w, output_h):
+        size_note = (
+            f"\n- Compatibilidade H.264: a mídia era {intro_media.original_width}×{intro_media.original_height}; "
+            f"a saída ficou {output_w}×{output_h} com dimensões pares."
+        )
 
     transcript_line = ""
     if transcript_summary:
         transcript_line = f"\n\n**Transcrição identificada**\n{transcript_summary.strip()}"
 
-    audio_report = (
-        "Áudio de recuperação enviado pelo usuário, confirmado no MP4 final"
-        if recuperar_audio else
-        "Áudio original detectado e confirmado no MP4 final"
-    )
     report = (
         "### Vídeo gerado\n"
         f"- Saída: {final_info.width}×{final_info.height}, {final_info.fps:.2f} FPS, "
         f"{final_info.duration:.2f}s.\n"
         f"{media_line}\n"
         f"{structure_line}\n"
-        f"- Áudio: {audio_report} (AAC, {output_bitrate})."
+        f"- Áudio original: {'mantido do começo ao fim' if info.has_audio else 'o arquivo não possuía áudio'}."
         f"{loop_line}{detection_line}{size_note}{transcript_line}"
     )
 
-    # O Gradio entrega o MP4 final. Intermediários de vários MB não precisam
-    # permanecer em disco até o próximo usuário abrir a ferramenta.
-    for temporary in job_dir.iterdir():
-        if temporary != output_path:
-            if temporary.is_dir():
-                shutil.rmtree(temporary, ignore_errors=True)
-            else:
-                temporary.unlink(missing_ok=True)
-    logger.info("render_complete duration=%.2fs output_mb=%.2f quality=%s",
-                time.monotonic() - started_at,
-                output_path.stat().st_size / (1024 * 1024), quality_profile)
     _safe_progress(progress, 1.0, "Pronto.")
     return ProcessResult(str(output_path), report, transition)
