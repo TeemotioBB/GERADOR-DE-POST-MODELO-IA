@@ -29,7 +29,7 @@ from .config import (
     TEMP_MAX_AGE_HOURS,
     WORK_ROOT,
 )
-from .media import MediaError, PreparedIntroMedia, prepare_intro_media, probe_video, require_binary, run_command, scaled_even_dimensions
+from .media import MediaError, PreparedIntroMedia, has_audible_audio, prepare_intro_media, probe_video, require_binary, run_command, scaled_even_dimensions
 from .transition import TransitionResult, detect_intro_end
 
 ProgressFn = Callable[[float, str], None]
@@ -396,12 +396,17 @@ def process_video(
     info = probe_video(video_path)
     if info.duration <= 0:
         raise MediaError("A duração do vídeo original é inválida.")
-    recuperar_audio = not info.has_audio and bool(audio_recovery_path)
-    if not info.has_audio and not recuperar_audio:
+    # Faixa que existe mas é muda conta como "sem áudio": o ffprobe sozinho não percebe.
+    original_audivel = info.has_audio and has_audible_audio(video_path)
+    recuperar_audio = not original_audivel and bool(audio_recovery_path)
+    if not original_audivel and not recuperar_audio:
+        motivo = (
+            "O vídeo original tem uma faixa de áudio, mas ela está MUDA (silêncio total)."
+            if info.has_audio else "O vídeo original não contém faixa de áudio."
+        )
         raise MediaError(
-            "O vídeo original não contém faixa de áudio. Na seção 'Recuperar áudio', "
-            "envie um arquivo de áudio com a mesma duração do Reel, "
-            "ou envie o original em MP4 com som."
+            f"{motivo} Na seção 'Recuperar áudio', envie um arquivo de áudio com a mesma "
+            "duração do Reel, ou envie o original em MP4 com som."
         )
     if recuperar_audio:
         _validar_audio_externo(str(audio_recovery_path), info.duration)
@@ -591,12 +596,12 @@ def process_video(
 
     _safe_progress(progress, 0.96, "Validando o vídeo final...")
     final_info = probe_video(output_path)
-    if not final_info.has_audio:
+    if not final_info.has_audio or not has_audible_audio(output_path):
         # Nunca anunciar sucesso caso a saída tenha perdido a faixa do original.
         output_path.unlink(missing_ok=True)
         raise MediaError(
-            "A exportação terminou, mas a faixa de áudio original não foi "
-            "encontrada no MP4 final. O vídeo foi rejeitado para evitar "
+            "A exportação terminou, mas o MP4 final está sem áudio audível (faixa "
+            "ausente ou muda). O vídeo foi rejeitado para evitar "
             "um download sem som. Tente novamente ou envie o arquivo original."
         )
 
