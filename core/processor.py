@@ -4,6 +4,7 @@ import math
 import shutil
 import time
 import uuid
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -27,10 +28,31 @@ from .config import (
     TEMP_MAX_AGE_HOURS,
     WORK_ROOT,
 )
-from .media import MediaError, PreparedIntroMedia, prepare_intro_media, probe_video, require_binary, run_command
+from .media import MediaError, PreparedIntroMedia, prepare_intro_media, probe_video, require_binary, run_command, scaled_even_dimensions
 from .transition import TransitionResult, detect_intro_end
 
 ProgressFn = Callable[[float, str], None]
+logger = logging.getLogger(__name__)
+
+
+# Perfis definidos no servidor, nunca aceitos como parâmetros de FFmpeg arbitrários.
+QUALITY_STANDARD = "Padrão (1080p)"
+QUALITY_ECONOMY = "Econômico (720p)"
+
+
+def export_settings(source_width: int, source_height: int, source_fps: float,
+                    quality_profile: str = QUALITY_STANDARD) -> tuple[int, int, float, int, str]:
+    """Preserva o formato do vídeo original; limita resolução/fps/custo por perfil."""
+    if quality_profile not in {QUALITY_STANDARD, QUALITY_ECONOMY}:
+        raise MediaError("Escolha um perfil de exportação válido.")
+    requested_edge = 1280 if quality_profile == QUALITY_ECONOMY else 1920
+    cap = min(requested_edge, OUTPUT_MAX_LONG_EDGE) if OUTPUT_MAX_LONG_EDGE else requested_edge
+    width, height = scaled_even_dimensions(source_width, source_height, cap)
+    fps = min(source_fps, 30.0)  # reduz render de 60fps a 30fps, suficiente para o modo econômico
+    crf = 23 if quality_profile == QUALITY_ECONOMY else OUTPUT_CRF
+    bitrate = "128k" if quality_profile == QUALITY_ECONOMY else OUTPUT_AUDIO_BITRATE
+    return width, height, fps, crf, bitrate
+
 
 
 @dataclass(frozen=True)
@@ -40,8 +62,16 @@ class ProcessResult:
     transition_seconds: float
 
 
-def cleanup_old_jobs() -> None:
-    """Apaga jobs, previews e imports antigos do diretório temporário."""
+_last_cleanup = 0.0
+
+
+def cleanup_old_jobs(*, force: bool = False) -> None:
+    """Limpeza oportunista: sem thread, timer ou tráfego que mantenha o Railway ativo."""
+    global _last_cleanup
+    now = time.monotonic()
+    if not force and now - _last_cleanup < 900:
+        return
+    _last_cleanup = now
     cutoff = time.time() - TEMP_MAX_AGE_HOURS * 3600
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     for item in WORK_ROOT.iterdir():
@@ -54,6 +84,23 @@ def cleanup_old_jobs() -> None:
                 item.unlink(missing_ok=True)
         except OSError:
             continue
+
+    # Uploads e prévias também passam pelo cache interno do Gradio. Removê-los
+    # somente em eventos de uso, sem timers, para permitir Railway Serverless.
+    import os
+    cache_root = Path(os.getenv("GRADIO_TEMP_DIR", "/tmp/gradio"))
+    if cache_root.is_dir():
+        cache_hours = max(2.0, float(os.getenv("GRADIO_CACHE_MAX_AGE_HOURS", "6")))
+        cache_cutoff = time.time() - 3600 * cache_hours
+        for item in cache_root.iterdir():
+            try:
+                if item.stat().st_mtime < cache_cutoff:
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink(missing_ok=True)
+            except OSError:
+                continue
 
 
 def _safe_progress(progress: ProgressFn | None, value: float, description: str) -> None:
@@ -223,14 +270,10 @@ def _build_filter_complex(
     intro_label = "introready"
 
     if has_continuation:
-        # Margem de segurança de ~2 quadros: vídeos de celular (VFR) podem ter
-        # timestamps levemente imprecisos e deixar 1-2 quadros da cena antiga
-        # "vazarem" no início da continuação. Pular 0.07s do vídeo original a
-        # partir da troca elimina isso sem efeito visível no take de continuação.
-        safety_margin = 0.07
-        continuation_start = min(transition + safety_margin, max(transition, duration - 0.05))
+        # Áudio original é mantido integralmente. Corte de vídeo no mesmo
+        # instante da troca evita o descompasso de 70 ms da versão anterior.
         chains.append(
-            f"[1:v]trim=start={continuation_start:.6f},setpts=PTS-STARTPTS[contsrc]"
+            f"[1:v]trim=start={transition:.6f},setpts=PTS-STARTPTS[contsrc]"
         )
         fit_chain, cont_label = _fit_filter("contsrc", width, height, fps, fit_mode)
         chains.append(fit_chain)
@@ -300,9 +343,11 @@ def process_video(
     language: str,
     caption_events_override: list[dict] | None = None,
     progress: ProgressFn | None = None,
+    quality_profile: str = QUALITY_STANDARD,
 ) -> ProcessResult:
     """Gera o vídeo final. ``photo_path`` aceita imagem ou vídeo por compatibilidade de API."""
 
+    started_at = time.monotonic()
     cleanup_old_jobs()
     require_binary("ffmpeg")
     require_binary("ffprobe")
@@ -327,16 +372,17 @@ def process_video(
             f"{MAX_VIDEO_MINUTES:.0f} minutos."
         )
 
+    output_w, output_h, output_fps, output_crf, output_bitrate = export_settings(
+        info.width, info.height, info.fps, quality_profile
+    )
     intro_media = prepare_intro_media(
         photo_path,
         job_dir,
-        max_long_edge=OUTPUT_MAX_LONG_EDGE,
+        max_long_edge=max(output_w, output_h),
     )
     if intro_media.kind == "video" and (intro_media.duration or 0) <= 0:
         raise MediaError("O vídeo enviado como mídia inicial possui duração inválida.")
 
-    output_w = intro_media.output_width
-    output_h = intro_media.output_height
 
     _safe_progress(progress, 0.16, "Identificando onde termina o primeiro take...")
     transition, detection, has_continuation = _resolve_transition(
@@ -412,7 +458,7 @@ def process_video(
         normalized_intro_path,
         width=output_w,
         height=output_h,
-        fps=info.fps,
+        fps=output_fps,
         duration=intro_duration,
     )
 
@@ -420,7 +466,7 @@ def process_video(
     filter_complex, video_label, audio_label = _build_filter_complex(
         width=output_w,
         height=output_h,
-        fps=info.fps,
+        fps=output_fps,
         duration=info.duration,
         transition=transition,
         has_continuation=has_continuation,
@@ -450,7 +496,7 @@ def process_video(
             "-loop",
             "1",
             "-framerate",
-            f"{info.fps:.6f}",
+            f"{output_fps:.6f}",
             "-i",
             overlay.path,
         ])
@@ -474,7 +520,7 @@ def process_video(
             "-preset",
             OUTPUT_PRESET,
             "-crf",
-            str(OUTPUT_CRF),
+            str(output_crf),
             "-pix_fmt",
             "yuv420p",
             "-threads",
@@ -484,7 +530,7 @@ def process_video(
         ]
     )
     if audio_label:
-        command.extend(["-c:a", "aac", "-b:a", OUTPUT_AUDIO_BITRATE])
+        command.extend(["-c:a", "aac", "-b:a", output_bitrate])
     else:
         command.append("-an")
     command.extend(["-max_muxing_queue_size", "2048", str(output_path)])
@@ -526,17 +572,10 @@ def process_video(
                 f"{intro_duration:.2f}s para coincidir com a troca do take."
             )
 
-    size_note = ""
-    if max(intro_media.original_width, intro_media.original_height) > max(output_w, output_h) + 1:
-        size_note = (
-            f"\n- Resolução otimizada: a mídia era {intro_media.original_width}×{intro_media.original_height}; "
-            f"a saída ficou {output_w}×{output_h}, preservando a proporção."
-        )
-    elif (intro_media.original_width, intro_media.original_height) != (output_w, output_h):
-        size_note = (
-            f"\n- Compatibilidade H.264: a mídia era {intro_media.original_width}×{intro_media.original_height}; "
-            f"a saída ficou {output_w}×{output_h} com dimensões pares."
-        )
+    size_note = (
+        f"\n- Formato de saída baseado no original: {output_w}×{output_h}, "
+        "adaptando a nova mídia com margens pretas quando necessário."
+    )
 
     transcript_line = ""
     if transcript_summary:
@@ -552,5 +591,16 @@ def process_video(
         f"{loop_line}{detection_line}{size_note}{transcript_line}"
     )
 
+    # O Gradio entrega o MP4 final. Intermediários de vários MB não precisam
+    # permanecer em disco até o próximo usuário abrir a ferramenta.
+    for temporary in job_dir.iterdir():
+        if temporary != output_path:
+            if temporary.is_dir():
+                shutil.rmtree(temporary, ignore_errors=True)
+            else:
+                temporary.unlink(missing_ok=True)
+    logger.info("render_complete duration=%.2fs output_mb=%.2f quality=%s",
+                time.monotonic() - started_at,
+                output_path.stat().st_size / (1024 * 1024), quality_profile)
     _safe_progress(progress, 1.0, "Pronto.")
     return ProcessResult(str(output_path), report, transition)
