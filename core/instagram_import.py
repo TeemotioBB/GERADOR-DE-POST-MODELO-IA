@@ -129,7 +129,7 @@ def _opcoes_yt_dlp(
 
     opcoes = {
         "outtmpl": template,
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
+        "format": "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/best",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
