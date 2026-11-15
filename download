@@ -1,0 +1,17 @@
+.git
+.gitignore
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+tests/
+*.zip
+*.log
+.env
+.env.*
+!env.example
+.venv/
+venv/
+*.mp4
+*.mov
+*.mkv
