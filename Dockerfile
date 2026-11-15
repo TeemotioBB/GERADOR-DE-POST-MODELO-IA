@@ -4,6 +4,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     GRADIO_ANALYTICS_ENABLED=False \
+    GRADIO_TELEMETRY_ENABLED=False \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    TOKENIZERS_PARALLELISM=false \
     GRADIO_TEMP_DIR=/tmp/gradio \
     WORK_ROOT=/tmp/foto_video_saas
 
@@ -18,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr-por \
     tesseract-ocr-eng \
     tesseract-ocr-spa \
-    libgl1 \
     libglib2.0-0 \
     && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
@@ -26,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install -r requirements.txt
 
 COPY . .
 RUN mkdir -p /tmp/gradio /tmp/foto_video_saas
