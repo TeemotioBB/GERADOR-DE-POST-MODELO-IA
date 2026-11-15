@@ -187,7 +187,7 @@ def _arquivo_baixado(pasta: Path, identificador: str) -> Path | None:
     return next((p for p in candidatos if p.suffix.lower() == ".mp4"), None)
 
 
-def _validar_arquivo_com_audio(arquivo: Path | None, limite_bytes: int, limite_mb: int) -> None:
+def _validar_arquivo_com_audio(arquivo: Path | None, limite_bytes: int, limite_mb: int, *, aceitar_sem_audio: bool = False) -> None:
     if arquivo is None:
         raise InstagramImportError("O download terminou, mas não foi encontrado um arquivo MP4.")
     if arquivo.stat().st_size > limite_bytes:
@@ -196,7 +196,7 @@ def _validar_arquivo_com_audio(arquivo: Path | None, limite_bytes: int, limite_m
         info = probe_video(arquivo)
     except (MediaError, ValueError, OSError) as exc:
         raise InstagramImportError("O Instagram retornou um arquivo de vídeo inválido.") from exc
-    if not info.has_audio:
+    if not info.has_audio and not aceitar_sem_audio:
         raise InstagramImportError(
             "O Instagram retornou apenas a imagem do Reel, sem a faixa de áudio."
         )
@@ -207,6 +207,7 @@ def baixar_video_instagram(
     pasta_destino: str,
     identificador: str,
     limite_mb: int = 200,
+    permitir_sem_audio: bool = False,
 ) -> tuple[str, str]:
     """Baixa vídeo + áudio e verifica a faixa real antes de aceitar a importação.
 
@@ -250,9 +251,12 @@ def baixar_video_instagram(
                 )
                 titulo = ((info or {}).get("title") or (info or {}).get("id") or titulo).strip()
                 arquivo = _arquivo_baixado(pasta, identificador)
-                _validar_arquivo_com_audio(arquivo, limite_bytes, limite_mb)
+                _validar_arquivo_com_audio(arquivo, limite_bytes, limite_mb, aceitar_sem_audio=permitir_sem_audio)
                 nome = re.sub(r"[^A-Za-z0-9._-]+", "_", titulo).strip("._")[:80]
-                logger.info("Instagram importado com áudio, tentativa %s (%s)", indice, metodo)
+                if permitir_sem_audio and not probe_video(arquivo).has_audio:
+                    logger.warning("Instagram importado sem áudio por escolha explícita do usuário")
+                else:
+                    logger.info("Instagram importado com áudio, tentativa %s (%s)", indice, metodo)
                 sucesso = True
                 return str(arquivo), f"{nome or 'reel_instagram'}.mp4"
             except yt_dlp.utils.DownloadError as exc:
@@ -272,7 +276,8 @@ def baixar_video_instagram(
             raise InstagramImportError(
                 "O Reel tem som no Instagram, mas o Instagram não forneceu a faixa de áudio "
                 "ao servidor. A importação foi interrompida para não gerar um vídeo mudo. "
-                "Tente enviar um MP4 com áudio pelo campo de arquivo. "
+                "Envie um MP4 com áudio, ou marque a opção de áudio externo "
+                "para importar o vídeo silencioso e anexar uma faixa separada. "
                 "Se tiver cookies do Instagram, configure INSTAGRAM_COOKIES_B64 no Railway."
             )
         if erro_login:
