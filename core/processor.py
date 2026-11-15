@@ -366,6 +366,12 @@ def process_video(
     info = probe_video(video_path)
     if info.duration <= 0:
         raise MediaError("A duração do vídeo original é inválida.")
+    if not info.has_audio:
+        raise MediaError(
+            "O vídeo original recebido não contém faixa de áudio. "
+            "Não é possível preservar um som que não veio no arquivo. "
+            "Baixe o Reels com áudio e envie o MP4 original novamente."
+        )
     if info.duration > MAX_VIDEO_MINUTES * 60:
         raise MediaError(
             f"O vídeo original tem {info.duration / 60:.1f} minutos. O limite configurado é "
@@ -542,6 +548,14 @@ def process_video(
 
     _safe_progress(progress, 0.96, "Validando o vídeo final...")
     final_info = probe_video(output_path)
+    if info.has_audio and not final_info.has_audio:
+        # Nunca anunciar sucesso caso a saída tenha perdido a faixa do original.
+        output_path.unlink(missing_ok=True)
+        raise MediaError(
+            "A exportação terminou, mas a faixa de áudio original não foi "
+            "encontrada no MP4 final. O vídeo foi rejeitado para evitar "
+            "um download sem som. Tente novamente ou envie o arquivo original."
+        )
 
     detection_line = ""
     if detection:
@@ -587,7 +601,7 @@ def process_video(
         f"{final_info.duration:.2f}s.\n"
         f"{media_line}\n"
         f"{structure_line}\n"
-        f"- Áudio original: {'mantido do começo ao fim' if info.has_audio else 'o arquivo não possuía áudio'}."
+        f"- Áudio original: faixa detectada no original e confirmada no MP4 final (AAC, {output_bitrate})."
         f"{loop_line}{detection_line}{size_note}{transcript_line}"
     )
 
