@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -140,6 +141,38 @@ def probe_video(path: str | Path) -> VideoInfo:
         codec_name=video_stream.get("codec_name"),
         rotation=rotation,
     )
+
+
+SILENCE_THRESHOLD_DB = -60.0
+
+
+def audio_peak_db(path: str | Path) -> float | None:
+    """Pico de volume (dBFS) do 1º áudio do arquivo; None se não há faixa decodificável.
+
+    O ffprobe só informa que a faixa EXISTE. Reels importados podem trazer uma
+    faixa de áudio presente porém totalmente muda (~ -91 dB). Esta medição
+    decodifica somente o áudio (-vn), então é rápida.
+    """
+    ffmpeg = require_binary("ffmpeg")
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-i", str(path), "-map", "0:a:0",
+             "-vn", "-af", "volumedetect", "-f", "null", "-"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    found = re.search(r"max_volume:\s*(-?[\d.]+|-?inf)\s*dB", result.stderr)
+    if not found:
+        return None
+    value = found.group(1)
+    return float("-inf") if "inf" in value else float(value)
+
+
+def has_audible_audio(path: str | Path, threshold_db: float = SILENCE_THRESHOLD_DB) -> bool:
+    """True somente se existe faixa de áudio COM som (pico acima do limiar)."""
+    peak = audio_peak_db(path)
+    return peak is not None and peak > threshold_db
 
 
 def scaled_even_dimensions(width: int, height: int, max_long_edge: int = 0) -> tuple[int, int]:
